@@ -90,9 +90,15 @@ struct blockif_elem {
 struct blockif_ctxt {
 	int bc_magic;
 
+    // backing file fds
 	int *bc_fd;
 	int bc_num_fd;
 
+    // sparse lookup table
+    int bc_sparse;
+    int bc_sparse_fd;
+    uint32_t *bc_sparse_lut;
+    
 	int bc_ischr;
 	int bc_isgeom;
 	int bc_candelete;
@@ -220,24 +226,178 @@ blockif_get_fd(struct blockif_ctxt *bc, size_t offset) {
 }
 
 static ssize_t
+blockif_sparse_read(struct blockif_ctxt *bc, size_t disk_offset, size_t segment_offset, uint8_t *buf, size_t len) {
+    int fd = blockif_get_fd(bc, disk_offset);
+    size_t sector_size = (size_t)bc->bc_sectsz;
+    size_t block = 0;
+
+    if (bc->bc_split) {
+        // split file image, add file segment offset
+        size_t i = (disk_offset / (size_t)bc->bc_split);
+        block += i * (bc->bc_split / sector_size);
+    }
+
+    // read
+    size_t remaining = len;
+    while (remaining > 0) {
+        size_t current_block = block + (segment_offset / sector_size);
+        if (current_block > bc->bc_size / sector_size) {
+            fprintf(stderr, "reading past end of disk, requested block %zu of %zu (offset: %zu)\n", current_block, bc->bc_size / sector_size, disk_offset);
+            errno = EFAULT;
+            return -1;
+        }
+        // fprintf(stderr, "reading block %zu/%zu -> offset %d\n", current_block, bc->bc_size / sector_size, bc->bc_sparse_lut[current_block]);
+        
+        size_t shift_offset = segment_offset % sector_size; // offset _in_ a sector
+        size_t read_len = (remaining > sector_size) ? sector_size : remaining;
+        
+        if (bc->bc_sparse_lut[current_block] < 0xffffffff) {
+            // allocated block, get offset and read from file
+            size_t seek_offset = bc->bc_sparse_lut[current_block] * sector_size + shift_offset;
+            lseek(fd, (off_t)seek_offset, SEEK_SET);
+            
+            ssize_t result = read(fd, buf, read_len - shift_offset);
+            // fprintf(stderr, "sparse read disk %zu, segment %zu, len %zu -> read %zu bytes\n", disk_offset, segment_offset, read_len, result);
+            if (result < 0) {
+                return result;
+            }
+        } else {
+            // sparse block, fill buffer with zeroes
+            // fprintf(stderr, "sparse read disk %zu, segment %zu, len %zu -> memset\n", disk_offset, segment_offset, read_len);
+            memset(buf, 0, read_len - shift_offset);
+        }
+        
+        // advance buffer
+        if (remaining > sector_size - shift_offset) {
+            remaining -= sector_size - shift_offset;
+            buf += sector_size - shift_offset;
+            segment_offset += sector_size - shift_offset;
+        } else {
+            remaining = 0;
+        }
+    }
+    
+    return (ssize_t)len;
+}
+
+static ssize_t
+blockif_sparse_write(struct blockif_ctxt *bc, size_t disk_offset, size_t segment_offset, uint8_t *buf, size_t len) {
+    int fd = blockif_get_fd(bc, disk_offset);
+    size_t sector_size = (size_t)bc->bc_sectsz;
+    size_t block = 0;
+    
+    if (bc->bc_split) {
+        // split file image, add file segment offset
+        size_t i = (disk_offset / (size_t)bc->bc_split);
+        block += i * (bc->bc_split / sector_size);
+    }
+    
+    // read
+    size_t remaining = len;
+    while (remaining > 0) {
+        size_t current_block = block + (segment_offset / sector_size);
+        if (current_block > bc->bc_size / sector_size) {
+            fprintf(stderr, "writing past end of disk, requested block %zu of %zu (offset: %zu)\n", current_block, bc->bc_size / sector_size, disk_offset);
+            errno = EFAULT;
+            return -1;
+        }
+        // fprintf(stderr, "writing block %zu\n", current_block);
+
+        size_t shift_offset = segment_offset % sector_size; // offset _in_ a sector
+        size_t write_len = (remaining > sector_size) ? sector_size : remaining;
+        
+        if (bc->bc_sparse_lut[current_block] < 0xffffffff) {
+            // allocated block, get offset and read from file
+            size_t seek_offset = bc->bc_sparse_lut[current_block] * sector_size + shift_offset;
+            lseek(fd, (off_t)seek_offset, SEEK_SET);
+            
+            ssize_t result = write(fd, buf, write_len - shift_offset);
+            // fprintf(stderr, "sparse write disk %zu, segment %zu, len %zu -> existing block %zu bytes\n", disk_offset, segment_offset, write_len, result);
+            if (result < 0) {
+                return result;
+            }
+        } else {
+            // sparse block, append to file
+            struct stat sbuf;
+            ssize_t result;
+            
+            // check if the buffer is zeroes only
+            int zeroes_only = 1;
+            for (uint8_t *ptr = buf; ptr < buf + write_len - shift_offset; ptr++) {
+                if (*ptr != 0) {
+                    zeroes_only = 0;
+                    break;
+                }
+            }
+            if (!zeroes_only) {
+                // save sector offset into lut
+                fstat(fd, &sbuf);
+                bc->bc_sparse_lut[current_block] = (uint32_t)((size_t)sbuf.st_size / (size_t)sector_size);
+                lseek(bc->bc_sparse_fd, (off_t)(current_block * 4), SEEK_SET);
+                result = write(bc->bc_sparse_fd, bc->bc_sparse_lut + current_block, 4);
+                if (result < 0) {
+                    return result;
+                }
+                fsync(bc->bc_sparse_fd);
+                
+                // create sector
+                lseek(fd, 0, SEEK_END);
+                char zeroBuffer[sector_size];
+                memset(zeroBuffer, 0, sector_size);
+                write(fd, zeroBuffer, sector_size);
+                
+                // overwrite with data
+                size_t seek_offset = bc->bc_sparse_lut[current_block] * sector_size + shift_offset;
+                lseek(fd, (off_t)seek_offset, SEEK_SET);
+                result = write(fd, buf, write_len - shift_offset);
+                // fprintf(stderr, "sparse write disk %zu, segment %zu, len %zu -> new block %zu bytes\n", disk_offset, segment_offset, write_len, result);
+                if (result < 0) {
+                    return result;
+                }
+                fsync(fd);
+            }
+        }
+        
+        // advance buffer
+        if (remaining > sector_size - shift_offset) {
+            remaining -= sector_size - shift_offset;
+            buf += sector_size - shift_offset;
+            segment_offset += sector_size - shift_offset;
+        } else {
+            remaining = 0;
+        }
+    }
+    
+    return (ssize_t)len;
+}
+
+static ssize_t
 blockif_read_data(struct blockif_ctxt *bc, uint8_t *buf, size_t len, size_t offset) {
 	// find correct fd
 	int fd = blockif_get_fd(bc, offset);
 	ssize_t bytes = 0;
 
-	if (bc->bc_split) {
-		lseek(fd, (off_t)(offset % bc->bc_split), SEEK_SET);
-	} else {
-		lseek(fd, (off_t)offset, SEEK_SET);
-	}
-
+    // fprintf(stderr, "read %zu bytes at %zu\n", len, offset);
+    
+    if (!bc->bc_sparse) {
+        if (bc->bc_split) {
+            lseek(fd, (off_t)(offset % bc->bc_split), SEEK_SET);
+        } else {
+            lseek(fd, (off_t)offset, SEEK_SET);
+        }
+    }
+    
 	// is this a multi part read
 	if ((bc->bc_split) && (offset % bc->bc_split + len > bc->bc_split)) {
 		// read is longer than current segment
 
 		// read until end of segment
 		size_t len1 = bc->bc_split - (offset % bc->bc_split);
-		bytes = read(fd, buf, len1);
+        if (bc->bc_sparse) {
+            bytes = blockif_sparse_read(bc, offset, (offset % bc->bc_split), buf, len1);
+        } else {
+            bytes = read(fd, buf, len1);
+        }
 		if (bytes < 0) {
 			return bytes;
 		}
@@ -245,15 +405,25 @@ blockif_read_data(struct blockif_ctxt *bc, uint8_t *buf, size_t len, size_t offs
 		// get next fd and read the rest
 		size_t len2 = len - len1;
 		fd = blockif_get_fd(bc, offset + len1);
-		lseek(fd, 0, SEEK_SET);
-		ssize_t result = read(fd, buf + len1, len2);
+
+        ssize_t result;
+        if (bc->bc_sparse) {
+            result = blockif_sparse_read(bc, offset + len1, 0, buf + len1, len2);
+        } else {
+            lseek(fd, 0, SEEK_SET);
+            result = read(fd, buf + len1, len2);
+        }
 		if (result < 0) {
 			return result;
 		}
 		bytes += result;
 	} else {
 		// read does not cross segment border
-		bytes = read(fd, buf, len);
+        if (bc->bc_sparse) {
+            bytes = blockif_sparse_read(bc, offset, (offset % bc->bc_split), buf, len);
+        } else {
+            bytes = read(fd, buf, len);
+        }
 	}
 
 	// return read bytes
@@ -266,11 +436,15 @@ blockif_write_data(struct blockif_ctxt *bc, uint8_t *buf, size_t len, size_t off
 	int fd = blockif_get_fd(bc, offset);
 	ssize_t bytes = 0;
 
-	if (bc->bc_split) {
-		lseek(fd, (off_t)(offset % bc->bc_split), SEEK_SET);
-	} else {
-		lseek(fd, (off_t)offset, SEEK_SET);
-	}
+    // fprintf(stderr, "write %zu bytes at %zu\n", len, offset);
+
+    if (!bc->bc_sparse) {
+        if (bc->bc_split) {
+            lseek(fd, (off_t)(offset % bc->bc_split), SEEK_SET);
+        } else {
+            lseek(fd, (off_t)offset, SEEK_SET);
+        }
+    }
 
 	// is this a multi part write
 	if ((bc->bc_split) && (offset % bc->bc_split + len > bc->bc_split)) {
@@ -278,7 +452,11 @@ blockif_write_data(struct blockif_ctxt *bc, uint8_t *buf, size_t len, size_t off
 
 		// write until end of segment
 		size_t len1 = bc->bc_split - (offset % bc->bc_split);
-		bytes = write(fd, buf, len1);
+        if (bc->bc_sparse) {
+            bytes = blockif_sparse_write(bc, offset, (offset % bc->bc_split), buf, len1);
+        } else {
+            bytes = write(fd, buf, len1);
+        }
 		if (bytes < 0) {
 			return bytes;
 		}
@@ -286,15 +464,26 @@ blockif_write_data(struct blockif_ctxt *bc, uint8_t *buf, size_t len, size_t off
 		// get next fd and write the rest
 		size_t len2 = len - len1;
 		fd = blockif_get_fd(bc, offset + len1);
-		lseek(fd, 0, SEEK_SET);
-		ssize_t result = write(fd, buf + len1, len2);
+        
+        ssize_t result;
+        if (bc->bc_sparse) {
+            result = blockif_sparse_write(bc, offset + len1, 0, buf + len1, len2);
+        } else {
+            lseek(fd, 0, SEEK_SET);
+            result = write(fd, buf + len1, len2);
+        }
+
 		if (result < 0) {
 			return result;
 		}
 		bytes += result;
 	} else {
 		// write does not cross segment border
-		bytes = write(fd, buf, len);
+        if (bc->bc_sparse) {
+            bytes = blockif_sparse_write(bc, offset, (offset % bc->bc_split), buf, len);
+        } else {
+            bytes = write(fd, buf, len);
+        }
 	}
 
 	// return written bytes
@@ -518,19 +707,23 @@ blockif_open(const char *optstr, UNUSED const char *ident)
 	// struct diocgattr_arg arg;
 	size_t size, psectsz, psectoff, split;
 	int extra, fd, sectsz;
-	int nocache, sync, ro, candelete, geom, ssopt, pssopt;
-	int *fds;
-
+	int nocache, sync, ro, candelete, geom, ssopt, pssopt, sparse;
+	int *fds, sparse_fd;
+    uint32_t *sparse_lut;
+    
 	pthread_once(&blockif_once, blockif_init);
 
 	fd = -1;
+    sparse_fd = -1;
 	fds = NULL;
+    sparse_lut = NULL;
 	ssopt = 0;
 	nocache = 0;
 	sync = 0;
 	ro = 0;
 	size = 0;
 	split = 0;
+    sparse = 0;
 
 	pssopt = 0;
 	/*
@@ -555,7 +748,7 @@ blockif_open(const char *optstr, UNUSED const char *ident)
 		else if (sscanf(cp, "size=%s", tmp) == 1) {
 			uint64_t num = 0;
 			if (expand_number(tmp, &num)) {
-				fprintf(stderr, "xhyve: could not parse size parameter: %s", strerror(errno));
+                perror("xhyve: could not parse size parameter");
 				goto err;
 			}
 			size = (size_t)num;
@@ -563,11 +756,13 @@ blockif_open(const char *optstr, UNUSED const char *ident)
 		else if (sscanf(cp, "split=%s", tmp) == 1) { /* split into chunks */
 			uint64_t num = 0;
 			if (expand_number(tmp, &num)) {
-				fprintf(stderr, "xhyve: could not parse split parameter: %s", strerror(errno));
+                perror("xhyve: could not parse split parameter");
 				goto err;
 			}
 			split = (size_t)num;
 		}
+        else if (!strcmp(cp, "sparse"))
+            sparse = 1;
 		else {
 			fprintf(stderr, "Invalid device option \"%s\"\n", cp);
 			goto err;
@@ -609,9 +804,10 @@ blockif_open(const char *optstr, UNUSED const char *ident)
 			if (fd < 0 && !ro) {
 				perror("Could not open backing file r/w, reverting to readonly");
 				/* Attempt a r/w fail with a r/o open */
-				fd = open(nopt, O_RDONLY | extra);
+				fd = open(filename, O_RDONLY | extra);
 				ro = 1;
 			}
+            free(filename);
 
 			if (fd < 0) {
 				perror("Could not open backing file");
@@ -627,24 +823,25 @@ blockif_open(const char *optstr, UNUSED const char *ident)
 				// create image file
 				printf("   -> file does not exist, creating empty file\n");
 				fchmod(fd, 0660);
-				char buffer[1024];
-				memset(buffer, 0, 1024);
-				for(size_t j = 0; j < split / 1024; j++) {
-					write(fd, buffer, 1024);
-				}
+                if (!sparse) {
+                    char buffer[1024];
+                    memset(buffer, 0, 1024);
+                    for(size_t j = 0; j < split / 1024; j++) {
+                        write(fd, buffer, 1024);
+                    }
+                }
 				lseek(fd, 0, SEEK_SET);
 			}
 
 			fds[i] = fd;
-			free(filename);
 		}
 	} else {
         // open a single file
-
         printf("Single image disk\n");
 
 		fd = open(nopt, (ro ? O_RDONLY : O_RDWR | O_CREAT) | extra);
 		if (fd < 0 && !ro) {
+            perror("Could not open backing file r/w, reverting to readonly");
 			/* Attempt a r/w fail with a r/o open */
 			fd = open(nopt, O_RDONLY | extra);
 			ro = 1;
@@ -668,15 +865,17 @@ blockif_open(const char *optstr, UNUSED const char *ident)
 			// create image file
 			printf(" -> file does not exist, creating empty file\n");
 			fchmod(fd, 0660);
-			char buffer[1024];
-			memset(buffer, 0, 1024);
-			for(size_t i = 0; i < size / 1024; i++) {
-				write(fd, buffer, 1024);
-			}
+            if (!sparse) {
+                char buffer[1024];
+                memset(buffer, 0, 1024);
+                for(size_t i = 0; i < size / 1024; i++) {
+                    write(fd, buffer, 1024);
+                }
+            }
 			lseek(fd, 0, SEEK_SET);
 		}
-	}
-
+    }
+    
     /*
 	 * Deal with raw devices
 	 */
@@ -734,6 +933,58 @@ blockif_open(const char *optstr, UNUSED const char *ident)
 		psectoff = 0;
 	}
 
+    if (sparse) {
+        size_t len = strlen(nopt) + 6;
+        char *filename = calloc(len, 1);
+        snprintf(filename, len, "%s.lut", nopt);
+
+        // open lut file
+        sparse_fd = open(filename, (ro ? O_RDONLY : O_RDWR | O_CREAT) | extra);
+        if (sparse_fd < 0 && !ro) {
+            perror("Could not open sparse lut file r/w, reverting to readonly");
+            /* Attempt a r/w fail with a r/o open */
+            sparse_fd = open(filename, O_RDONLY | extra);
+            ro = 1;
+        }
+        free(filename);
+        
+        if (sparse_fd < 0) {
+            perror("Could not open sparse lut file");
+            goto err;
+        }
+        
+        if (fstat(sparse_fd, &sbuf) < 0) {
+            perror("Could not stat sparse lut file");
+            goto err;
+        }
+        
+        if (sbuf.st_size == 0) {
+            // TODO: make growing disks possible
+            // create lut file
+            printf(" -> sparse lut file does not exist, creating empty file\n");
+            fchmod(sparse_fd, 0660);
+            unsigned char buffer[4] = { 0xff, 0xff, 0xff, 0xff };
+            for(size_t i = 0; i < size / (size_t)sectsz; i++) {
+                write(sparse_fd, buffer, 4);
+            }
+            lseek(sparse_fd, 0, SEEK_SET);
+            fstat(fd, &sbuf);
+        }
+
+        // read sparse lut
+        sparse_lut = malloc((size_t)sbuf.st_size);
+        ssize_t bytes = 0;
+        for (size_t i = 0; i < (size_t)sbuf.st_size; i += 1024) {
+            ssize_t result = read(sparse_fd, (char *)sparse_lut + i, 1024);
+            if (result < 0) {
+                perror("Could not load sparse lut");
+                goto err;
+            }
+            bytes += result;
+        }
+//        fprintf(stderr, "Read %zu bytes of lut\n", bytes);
+    }
+
 	bc = calloc(1, sizeof(struct blockif_ctxt));
 	if (bc == NULL) {
 		perror("calloc");
@@ -749,6 +1000,11 @@ blockif_open(const char *optstr, UNUSED const char *ident)
 		bc->bc_num_fd = (int)(size / split);
 		bc->bc_fd = fds;
 	}
+    bc->bc_sparse = sparse;
+    if (sparse) {
+        bc->bc_sparse_lut = sparse_lut;
+        bc->bc_sparse_fd = sparse_fd;
+    }
 	bc->bc_ischr = S_ISCHR(sbuf.st_mode);
 	bc->bc_isgeom = geom;
 	bc->bc_candelete = candelete;
@@ -953,6 +1209,12 @@ blockif_close(struct blockif_ctxt *bc)
 		close(bc->bc_fd[i]);
 	}
 	free(bc->bc_fd);
+    
+    if (bc->bc_sparse) {
+        close(bc->bc_sparse_fd);
+        free(bc->bc_sparse_lut);
+    }
+    
 	free(bc);
 
 	return (0);
