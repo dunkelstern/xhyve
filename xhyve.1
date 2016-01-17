@@ -211,6 +211,18 @@ Force the file to be opened read-only.
 Specify the logical and physical sector sizes of the emulated disk.
 The physical sector size is optional and is equal to the logical sector size
 if not explicitly specified.
+.It Li size=
+Size of the backing file for the block device, if the file does not exist and
+size is configured, a file of that size is created. You may use K, M or G as
+suffix to specify Kilobytes, Megabytes or Gigabytes.
+.It Li split=
+If split is configured the backing file will be split into chunks of this size.
+If split is given, size needs to be set too and should be a multiple of split
+to avoid wasting disk space.
+.It Li sparse
+If sparse is set the on-disk representation of the backing file will only store
+sectors that have actually been written to. If sparse is set size has to be
+specified too. This is incompatible with older disk images!
 .El
 .Pp
 TTY devices:
