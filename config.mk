@@ -36,6 +36,7 @@ CFLAGS_WARN := \
   -Werror \
   -Wno-unknown-warning-option \
   -Wno-reserved-id-macro \
+  -Wno-vla \
   -pedantic
 
 CFLAGS_DIAG := \
