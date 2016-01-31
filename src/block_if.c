@@ -125,12 +125,11 @@ static ssize_t blockif_sparse_read(blockif_ctxt bc, size_t disk_offset, size_t s
         uint32_t lut_entry = bc->sparse_lut[current_block];
         if (lut_entry < 0xffffffff) {
             // allocated block, get offset and read from file
-            size_t seek_offset = lut_entry * sector_size + shift_offset;
-            lseek(fd, (off_t)seek_offset, SEEK_SET);
+            off_t seek_offset = (off_t)(lut_entry * sector_size + shift_offset);
             
             ssize_t result;
             do {
-                result = read(fd, buf, read_len - shift_offset);
+                result = pread(fd, buf, read_len - shift_offset, seek_offset);
             } while ((result < 0) && ((errno == EAGAIN) || (errno == EINTR)));
 
             if (result < 0) {
@@ -186,12 +185,11 @@ static ssize_t blockif_sparse_write(blockif_ctxt bc, size_t disk_offset, size_t 
         uint32_t lut_entry = bc->sparse_lut[current_block];
         if (lut_entry < 0xffffffff) {
             // allocated block, get offset and read from file
-            size_t seek_offset = lut_entry * sector_size + shift_offset;
-            lseek(fd, (off_t)seek_offset, SEEK_SET);
+            off_t seek_offset = (off_t)(lut_entry * sector_size + shift_offset);
             
             ssize_t result;
             do {
-                result = write(fd, buf, write_len - shift_offset);
+                result = pwrite(fd, buf, write_len - shift_offset, seek_offset);
             } while ((result < 0) && ((errno == EAGAIN) || (errno == EINTR)));
 
             if (result < 0) {
@@ -222,9 +220,8 @@ static ssize_t blockif_sparse_write(blockif_ctxt bc, size_t disk_offset, size_t 
                 // save sector offset into lut
                 off_t size = lseek(fd, 0, SEEK_END);
                 bc->sparse_lut[current_block] = (uint32_t)((size_t)size / (size_t)sector_size);
-                lseek(bc->sparse_fd, (off_t)(current_block * 4), SEEK_SET);
                 do {
-                    result = write(bc->sparse_fd, bc->sparse_lut + current_block, 4);
+                    result = pwrite(bc->sparse_fd, bc->sparse_lut + current_block, 4, (off_t)(current_block * 4));
                 } while ((result < 0) && ((errno == EAGAIN) || (errno == EINTR)));
                 if (result < 0) {
                     return result;
@@ -232,16 +229,14 @@ static ssize_t blockif_sparse_write(blockif_ctxt bc, size_t disk_offset, size_t 
                 fsync(bc->sparse_fd);
                 
                 // create sector
-                lseek(fd, 0, SEEK_END);
                 char zeroBuffer[sector_size];
                 memset(zeroBuffer, 0, sector_size);
                 write(fd, zeroBuffer, sector_size);
                 
                 // overwrite with data
-                size_t seek_offset = bc->sparse_lut[current_block] * sector_size + shift_offset;
-                lseek(fd, (off_t)seek_offset, SEEK_SET);
+                off_t seek_offset = (off_t)(bc->sparse_lut[current_block] * sector_size + shift_offset);
                 do {
-                    result = write(fd, buf, write_len - shift_offset);
+                    result = pwrite(fd, buf, write_len - shift_offset, seek_offset);
                 } while ((result < 0) && ((errno == EAGAIN) || (errno == EINTR)));
 
                 if (result < 0) {
@@ -274,11 +269,12 @@ static ssize_t blockif_read_data(blockif_ctxt bc, uint8_t *buf, size_t len, size
 
 	ssize_t bytes = 0;
    
+    off_t seek_offset = 0;
     if (!bc->is_sparse) {
         if (bc->split_size) {
-            lseek(fd, (off_t)(offset % bc->split_size), SEEK_SET);
+            seek_offset = (off_t)(offset % bc->split_size);
         } else {
-            lseek(fd, (off_t)offset, SEEK_SET);
+            seek_offset = (off_t)offset;
         }
     }
     
@@ -292,7 +288,7 @@ static ssize_t blockif_read_data(blockif_ctxt bc, uint8_t *buf, size_t len, size
             if (bc->is_sparse) {
                 bytes = blockif_sparse_read(bc, offset, (offset % bc->split_size), buf, len1);
             } else {
-                bytes = read(fd, buf, len1);
+                bytes = pread(fd, buf, len1, seek_offset);
             }
         } while ((bytes < 0) && ((errno == EAGAIN) || (errno == EINTR)));
 		if (bytes < 0) {
@@ -308,8 +304,7 @@ static ssize_t blockif_read_data(blockif_ctxt bc, uint8_t *buf, size_t len, size
             if (bc->is_sparse) {
                 result = blockif_sparse_read(bc, offset + len1, 0, buf + len1, len2);
             } else {
-                lseek(fd, 0, SEEK_SET);
-                result = read(fd, buf + len1, len2);
+                result = pread(fd, buf + len1, len2, 0);
             }
         } while ((result < 0) && ((errno == EAGAIN) || (errno == EINTR)));
         
@@ -323,7 +318,7 @@ static ssize_t blockif_read_data(blockif_ctxt bc, uint8_t *buf, size_t len, size
             if (bc->is_sparse) {
                 bytes = blockif_sparse_read(bc, offset, (offset % bc->split_size), buf, len);
             } else {
-                bytes = read(fd, buf, len);
+                bytes = pread(fd, buf, len, seek_offset);
             }
         } while ((bytes < 0) && ((errno == EAGAIN) || (errno == EINTR)));
 	}
@@ -342,11 +337,12 @@ static ssize_t blockif_write_data(blockif_ctxt bc, uint8_t *buf, size_t len, siz
 
 	ssize_t bytes = 0;
 
+    off_t seek_offset = 0;
     if (!bc->is_sparse) {
         if (bc->split_size) {
-            lseek(fd, (off_t)(offset % bc->split_size), SEEK_SET);
+            seek_offset = (off_t)(offset % bc->split_size);
         } else {
-            lseek(fd, (off_t)offset, SEEK_SET);
+            seek_offset = (off_t)offset;
         }
     }
 
@@ -360,7 +356,7 @@ static ssize_t blockif_write_data(blockif_ctxt bc, uint8_t *buf, size_t len, siz
             if (bc->is_sparse) {
                 bytes = blockif_sparse_write(bc, offset, (offset % bc->split_size), buf, len1);
             } else {
-                bytes = write(fd, buf, len1);
+                bytes = pwrite(fd, buf, len1, seek_offset);
             }
         } while ((bytes < 0) && ((errno == EAGAIN) || (errno == EINTR)));
         
@@ -377,8 +373,7 @@ static ssize_t blockif_write_data(blockif_ctxt bc, uint8_t *buf, size_t len, siz
             if (bc->is_sparse) {
                 result = blockif_sparse_write(bc, offset + len1, 0, buf + len1, len2);
             } else {
-                lseek(fd, 0, SEEK_SET);
-                result = write(fd, buf + len1, len2);
+                result = pwrite(fd, buf + len1, len2, 0);
             }
         } while ((result < 0) && ((errno == EAGAIN) || (errno == EINTR)));
 
@@ -392,7 +387,7 @@ static ssize_t blockif_write_data(blockif_ctxt bc, uint8_t *buf, size_t len, siz
             if (bc->is_sparse) {
                 bytes = blockif_sparse_write(bc, offset, (offset % bc->split_size), buf, len);
             } else {
-                bytes = write(fd, buf, len);
+                bytes = pwrite(fd, buf, len, seek_offset);
             }
         } while ((bytes < 0) && ((errno == EAGAIN) || (errno == EINTR)));
 	}
@@ -411,7 +406,7 @@ blockif_ctxt blockif_open(const char *optstr, UNUSED const char *ident) {
     }
     
     bc->magic = (int) BLOCKIF_SIG;
-    bc->response_queue = dispatch_queue_create("org.xhyve.blockif.response", DISPATCH_QUEUE_SERIAL);
+    bc->response_queue = dispatch_queue_create("org.xhyve.blockif.response", DISPATCH_QUEUE_CONCURRENT);
 
 	/*
 	 * The first element in the optstring is always a pathname.
@@ -505,17 +500,13 @@ blockif_ctxt blockif_open(const char *optstr, UNUSED const char *ident) {
                 fchmod(bc->fd[i], 0660);
                 if (!bc->is_sparse) {
                     printf("   -> file does not exist, creating empty file\n");
-
-                    char buffer[1024];
-                    memset(buffer, 0, 1024);
-                    for(size_t j = 0; j < bc->split_size / 1024; j++) {
-                        ssize_t result;
-                        do {
-                            result = write(bc->fd[i], buffer, 1024);
-                        } while ((result < 0) && ((errno == EAGAIN) || (errno == EINTR)));
-                    }
+                    lseek(bc->fd[i], (off_t)(bc->split_size - 1), SEEK_SET);
+                    char buffer = 0;
+                    ssize_t result;
+                    do {
+                        result = write(bc->fd[i], &buffer, 1);
+                    } while ((result < 0) && ((errno == EAGAIN) || (errno == EINTR)));
                 }
-                lseek(bc->fd[i], 0, SEEK_SET);
             }
         }
     } else {
@@ -545,14 +536,12 @@ blockif_ctxt blockif_open(const char *optstr, UNUSED const char *ident) {
             fchmod(bc->fd[0], 0660);
             if (!bc->is_sparse) {
                 printf(" -> file does not exist, creating empty file\n");
-                char buffer[1024];
-                memset(buffer, 0, 1024);
-                for(size_t i = 0; i < bc->size / 1024; i++) {
-                    ssize_t result;
-                    do {
-                        result = write(bc->fd[0], buffer, 1024);
-                    } while ((result < 0) && ((errno == EAGAIN) || (errno == EINTR)));
-                }
+                lseek(bc->fd[0], (off_t)(bc->size - 1), SEEK_SET);
+                char buffer = 0;
+                ssize_t result;
+                do {
+                    result = write(bc->fd[0], &buffer, 1);
+                } while ((result < 0) && ((errno == EAGAIN) || (errno == EINTR)));
             }
         }
         bc->size = (size_t)lseek(bc->fd[0], 0, SEEK_END);
@@ -624,7 +613,7 @@ blockif_ctxt blockif_open(const char *optstr, UNUSED const char *ident) {
         snprintf(filename, len, "%s.lut", nopt);
         
         // open lut file
-        bc->sparse_fd = open(filename, (bc->is_readonly ? O_RDONLY : O_RDWR | O_CREAT) | extra);
+        bc->sparse_fd = open(filename, (bc->is_readonly ? O_RDONLY : O_RDWR | O_CREAT) | O_SYNC | extra);
         if (bc->sparse_fd < 0 && !bc->is_readonly) {
             perror("Could not open sparse lut file r/w, reverting to readonly");
             /* Attempt a r/w fail with a r/o open */
