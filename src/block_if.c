@@ -75,6 +75,8 @@ struct _blockif_ctxt {
 	int phys_sect_size;
 	int phys_sect_offset;
     
+    int no_cache;
+    
     dispatch_queue_t response_queue;
 };
 
@@ -421,9 +423,7 @@ blockif_ctxt blockif_open(const char *optstr, UNUSED const char *ident) {
         if (cp == nopt) {		/* file or device pathname */
 			continue;
         } else if (!strcmp(cp, "nocache")) {
-            perror("xhyve: nocache support unimplemented");
-            blockif_close(bc);
-            return NULL;
+            bc->no_cache = 1;
         } else if (!strcmp(cp, "sync") || !strcmp(cp, "direct")) {
             extra |= O_SYNC;
         } else if (!strcmp(cp, "ro")) {
@@ -494,6 +494,10 @@ blockif_ctxt blockif_open(const char *optstr, UNUSED const char *ident) {
                 blockif_close(bc);
                 return NULL;
             }
+            
+            if (bc->no_cache) {
+                fcntl(bc->fd[i], F_NOCACHE, 1);
+            }
 
             if (lseek(bc->fd[i], 0, SEEK_END) == 0) {
                 // create image file
@@ -528,6 +532,10 @@ blockif_ctxt blockif_open(const char *optstr, UNUSED const char *ident) {
             perror("Could not open backing file");
             blockif_close(bc);
             return NULL;
+        }
+
+        if (bc->no_cache) {
+            fcntl(bc->fd[0], F_NOCACHE, 1);
         }
 
         if (lseek(bc->fd[0], 0, SEEK_END) == 0) {
@@ -626,6 +634,10 @@ blockif_ctxt blockif_open(const char *optstr, UNUSED const char *ident) {
             perror("Could not open sparse lut file");
             blockif_close(bc);
             return NULL;
+        }
+        
+        if (bc->no_cache) {
+            fcntl(bc->sparse_fd, F_NOCACHE, 1);
         }
         
         size_t lut_size = (size_t)lseek(bc->sparse_fd, 0, SEEK_END);
