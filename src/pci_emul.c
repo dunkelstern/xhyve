@@ -705,9 +705,11 @@ pci_emul_finddev(char *name)
 
 	SET_FOREACH(pdpp, pci_devemu_set) {
 		pdp = *pdpp;
-		if (!strcmp(pdp->pe_emu, name)) {
-			return (pdp);
-		}
+        if (pdp) {
+            if (!strcmp(pdp->pe_emu, name)) {
+                return (pdp);
+            }
+        }
 	}
 
 	return (NULL);
