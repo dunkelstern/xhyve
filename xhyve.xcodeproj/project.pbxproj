@@ -176,8 +176,8 @@
 		42BFC7DF1C498F9400AC2C95 /* dsdt.asl */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = text; name = dsdt.asl; path = src/dsdt.asl; sourceTree = "<group>"; };
 		42BFC7E11C498F9400AC2C95 /* fbsd.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; path = fbsd.c; sourceTree = "<group>"; };
 		42BFC7E21C498F9400AC2C95 /* kexec.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; path = kexec.c; sourceTree = "<group>"; };
-		42BFC7E51C498F9400AC2C95 /* md5c.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; name = md5c.c; path = ../src/md5c.c; sourceTree = "<group>"; };
-		42BFC7F81C498F9400AC2C95 /* task_switch.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; name = task_switch.c; path = ../src/task_switch.c; sourceTree = "<group>"; };
+		42BFC7E51C498F9400AC2C95 /* md5c.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; path = md5c.c; sourceTree = "<group>"; };
+		42BFC7F81C498F9400AC2C95 /* task_switch.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; path = task_switch.c; sourceTree = "<group>"; };
 		42BFC7FD1C498F9400AC2C95 /* vmcs.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; path = vmcs.c; sourceTree = "<group>"; };
 		42BFC7FE1C498F9400AC2C95 /* vmx.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; path = vmx.c; sourceTree = "<group>"; };
 		42BFC7FF1C498F9400AC2C95 /* vmx_msr.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; path = vmx_msr.c; sourceTree = "<group>"; };
@@ -199,7 +199,7 @@
 		42BFC8101C498F9400AC2C95 /* vmm_stat.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; path = vmm_stat.c; sourceTree = "<group>"; };
 		42BFC8111C498F9400AC2C95 /* vmm_util.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; path = vmm_util.c; sourceTree = "<group>"; };
 		42BFC8121C498F9400AC2C95 /* x86.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; path = x86.c; sourceTree = "<group>"; };
-		42BFC8131C498F9400AC2C95 /* xhyve.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; name = xhyve.c; path = ../src/xhyve.c; sourceTree = "<group>"; };
+		42BFC8131C498F9400AC2C95 /* xhyve.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; path = xhyve.c; sourceTree = "<group>"; };
 		42BFC84C1C49939A00AC2C95 /* Hypervisor.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Hypervisor.framework; path = System/Library/Frameworks/Hypervisor.framework; sourceTree = SDKROOT; };
 		42BFC84E1C4993A100AC2C95 /* vmnet.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = vmnet.framework; path = System/Library/Frameworks/vmnet.framework; sourceTree = SDKROOT; };
 		42BFC8501C49947200AC2C95 /* xhyve.1 */ = {isa = PBXFileReference; lastKnownFileType = text.man; path = xhyve.1; sourceTree = SOURCE_ROOT; };
@@ -278,7 +278,8 @@
 				42BFC7F81C498F9400AC2C95 /* task_switch.c */,
 				42BFC8131C498F9400AC2C95 /* xhyve.c */,
 			);
-			path = xhyve;
+			name = xhyve;
+			path = src;
 			sourceTree = "<group>";
 		};
 		42BFC78F1C498F9400AC2C95 /* include */ = {

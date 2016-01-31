@@ -52,18 +52,19 @@ struct blockif_req {
 };
 #pragma clang diagnostic pop
 
-struct blockif_ctxt;
-struct blockif_ctxt *blockif_open(const char *optstr, const char *ident);
-off_t blockif_size(struct blockif_ctxt *bc);
-void blockif_chs(struct blockif_ctxt *bc, uint16_t *c, uint8_t *h, uint8_t *s);
-int blockif_sectsz(struct blockif_ctxt *bc);
-void blockif_psectsz(struct blockif_ctxt *bc, int *size, int *off);
-int blockif_queuesz(struct blockif_ctxt *bc);
-int blockif_is_ro(struct blockif_ctxt *bc);
-int blockif_candelete(struct blockif_ctxt *bc);
-int blockif_read(struct blockif_ctxt *bc, struct blockif_req *breq);
-int blockif_write(struct blockif_ctxt *bc, struct blockif_req *breq);
-int blockif_flush(struct blockif_ctxt *bc, struct blockif_req *breq);
-int blockif_delete(struct blockif_ctxt *bc, struct blockif_req *breq);
-int blockif_cancel(struct blockif_ctxt *bc, struct blockif_req *breq);
-int blockif_close(struct blockif_ctxt *bc);
+typedef struct _blockif_ctxt *blockif_ctxt;
+
+blockif_ctxt blockif_open(const char *optstr, const char *ident);
+off_t blockif_size(blockif_ctxt bc);
+void blockif_chs(blockif_ctxt bc, uint16_t *c, uint8_t *h, uint8_t *s);
+int blockif_sectsz(blockif_ctxt bc);
+void blockif_psectsz(blockif_ctxt bc, int *size, int *off);
+int blockif_queuesz(blockif_ctxt bc);
+int blockif_is_ro(blockif_ctxt bc);
+int blockif_candelete(blockif_ctxt bc);
+int blockif_read(blockif_ctxt bc, struct blockif_req *breq);
+int blockif_write(blockif_ctxt bc, struct blockif_req *breq);
+int blockif_flush(blockif_ctxt bc, struct blockif_req *breq);
+int blockif_delete(blockif_ctxt bc, struct blockif_req *breq);
+int blockif_cancel(blockif_ctxt bc, struct blockif_req *breq);
+int blockif_close(blockif_ctxt bc);

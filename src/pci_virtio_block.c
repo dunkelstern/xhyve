@@ -138,7 +138,7 @@ struct pci_vtblk_softc {
 	pthread_mutex_t vsc_mtx;
 	struct vqueue_info vbsc_vq;
 	struct vtblk_config vbsc_cfg;
-	struct blockif_ctxt *bc;
+	blockif_ctxt bc;
 	char vbsc_ident[VTBLK_BLK_ID_BYTES];
 	struct pci_vtblk_ioreq vbsc_ios[VTBLK_RINGSZ];
 };
@@ -310,7 +310,7 @@ static int
 pci_vtblk_init(struct pci_devinst *pi, char *opts)
 {
 	char bident[sizeof("XX:X:X")];
-	struct blockif_ctxt *bctxt;
+	blockif_ctxt bctxt;
 	MD5_CTX mdctx;
 	u_char digest[16];
 	struct pci_vtblk_softc *sc;

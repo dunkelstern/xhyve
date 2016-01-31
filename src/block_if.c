@@ -39,9 +39,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <pthread.h>
 #include <signal.h>
 #include <unistd.h>
+
+#include <dispatch/dispatch.h>
 
 #include <xhyve/support/atomic.h>
 #include <xhyve/xhyve.h>
@@ -49,221 +50,94 @@
 #include <xhyve/block_if.h>
 
 #define BLOCKIF_SIG 0xb109b109
-/* xhyve: FIXME
- *
- * // #define BLOCKIF_NUMTHR 8
- *
- * As split disk images probably need multiple reads and writes we can not
- * use preadv/pwritev, we need to serialize reads and writes
- * for the time being until we find a better solution.
- */
-#define BLOCKIF_NUMTHR 1
-
-#define BLOCKIF_MAXREQ (64 + BLOCKIF_NUMTHR)
-
-enum blockop {
-	BOP_READ,
-	BOP_WRITE,
-	BOP_FLUSH,
-	BOP_DELETE
-};
-
-enum blockstat {
-	BST_FREE,
-	BST_BLOCK,
-	BST_PEND,
-	BST_BUSY,
-	BST_DONE
-};
 
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wpadded"
-struct blockif_elem {
-	TAILQ_ENTRY(blockif_elem) be_link;
-	struct blockif_req *be_req;
-	enum blockop be_op;
-	enum blockstat be_status;
-	pthread_t be_tid;
-	off_t be_block;
-};
 
-struct blockif_ctxt {
-	int bc_magic;
+struct _blockif_ctxt {
+	int magic;
 
     // backing file fds
-	int *bc_fd;
-	int bc_num_fd;
+	int *fd;
+	unsigned long num_fd;
 
     // sparse lookup table
-    int bc_sparse;
-    int bc_sparse_fd;
-    uint32_t *bc_sparse_lut;
+    int is_sparse;
+    int sparse_fd;
+    uint32_t *sparse_lut;
+    uint32_t sparse_lut_size;
     
-	int bc_ischr;
-	int bc_isgeom;
-	int bc_candelete;
-	int bc_rdonly;
-	size_t bc_size;
-	size_t bc_split;
-	int bc_sectsz;
-	int bc_psectsz;
-	int bc_psectoff;
-	int bc_closing;
-	pthread_t bc_btid[BLOCKIF_NUMTHR];
-	pthread_mutex_t bc_mtx;
-	pthread_cond_t bc_cond;
-	/* Request elements and free/pending/busy queues */
-	TAILQ_HEAD(, blockif_elem) bc_freeq;
-	TAILQ_HEAD(, blockif_elem) bc_pendq;
-	TAILQ_HEAD(, blockif_elem) bc_busyq;
-	struct blockif_elem	bc_reqs[BLOCKIF_MAXREQ];
+	int can_delete;
+	int is_readonly;
+	size_t size;
+	size_t split_size;
+	int sect_size;
+	int phys_sect_size;
+	int phys_sect_offset;
+    
+    dispatch_queue_t response_queue;
 };
 
-static pthread_once_t blockif_once = PTHREAD_ONCE_INIT;
-
-struct blockif_sig_elem {
-	pthread_mutex_t bse_mtx;
-	pthread_cond_t bse_cond;
-	int bse_pending;
-	struct blockif_sig_elem *bse_next;
-};
-
-static struct blockif_sig_elem *blockif_bse_head;
 
 #pragma clang diagnostic pop
 
-static int
-blockif_enqueue(struct blockif_ctxt *bc, struct blockif_req *breq,
-		enum blockop op)
-{
-	struct blockif_elem *be, *tbe;
-	off_t off;
-	int i;
 
-	be = TAILQ_FIRST(&bc->bc_freeq);
-	assert(be != NULL);
-	assert(be->be_status == BST_FREE);
-	TAILQ_REMOVE(&bc->bc_freeq, be, be_link);
-	be->be_req = breq;
-	be->be_op = op;
-	switch (op) {
-	case BOP_READ:
-	case BOP_WRITE:
-	case BOP_DELETE:
-		off = breq->br_offset;
-		for (i = 0; i < breq->br_iovcnt; i++)
-			off += breq->br_iov[i].iov_len;
-		break;
-	case BOP_FLUSH:
-		off = OFF_MAX;
-	}
-	be->be_block = off;
-	TAILQ_FOREACH(tbe, &bc->bc_pendq, be_link) {
-		if (tbe->be_block == breq->br_offset)
-			break;
-	}
-	if (tbe == NULL) {
-		TAILQ_FOREACH(tbe, &bc->bc_busyq, be_link) {
-			if (tbe->be_block == breq->br_offset)
-				break;
-		}
-	}
-	if (tbe == NULL)
-		be->be_status = BST_PEND;
-	else
-		be->be_status = BST_BLOCK;
-	TAILQ_INSERT_TAIL(&bc->bc_pendq, be, be_link);
-	return (be->be_status == BST_PEND);
-}
-
-static int
-blockif_dequeue(struct blockif_ctxt *bc, pthread_t t, struct blockif_elem **bep)
-{
-	struct blockif_elem *be;
-
-	TAILQ_FOREACH(be, &bc->bc_pendq, be_link) {
-		if (be->be_status == BST_PEND)
-			break;
-		assert(be->be_status == BST_BLOCK);
-	}
-	if (be == NULL)
-		return (0);
-	TAILQ_REMOVE(&bc->bc_pendq, be, be_link);
-	be->be_status = BST_BUSY;
-	be->be_tid = t;
-	TAILQ_INSERT_TAIL(&bc->bc_busyq, be, be_link);
-	*bep = be;
-	return (1);
-}
-
-static void
-blockif_complete(struct blockif_ctxt *bc, struct blockif_elem *be)
-{
-	struct blockif_elem *tbe;
-
-	if (be->be_status == BST_DONE || be->be_status == BST_BUSY)
-		TAILQ_REMOVE(&bc->bc_busyq, be, be_link);
-	else
-		TAILQ_REMOVE(&bc->bc_pendq, be, be_link);
-	TAILQ_FOREACH(tbe, &bc->bc_pendq, be_link) {
-		if (tbe->be_req->br_offset == be->be_block)
-			tbe->be_status = BST_PEND;
-	}
-	be->be_tid = 0;
-	be->be_status = BST_FREE;
-	be->be_req = NULL;
-	TAILQ_INSERT_TAIL(&bc->bc_freeq, be, be_link);
-}
-
-static int
-blockif_get_fd(struct blockif_ctxt *bc, size_t offset) {
-	if (bc->bc_split) {
-		int i = (int)(offset / bc->bc_split);
-		return bc->bc_fd[i];
+static inline int blockif_get_fd(blockif_ctxt bc, size_t offset) {
+	if (bc->split_size) {
+		unsigned long i = offset / bc->split_size;
+        if (i >= bc->num_fd) {
+            return -1;
+        }
+		return bc->fd[i];
 	} else {
-		return bc->bc_fd[0];
+		return bc->fd[0];
 	}
 }
 
-static ssize_t
-blockif_sparse_read(struct blockif_ctxt *bc, size_t disk_offset, size_t segment_offset, uint8_t *buf, size_t len) {
+static ssize_t blockif_sparse_read(blockif_ctxt bc, size_t disk_offset, size_t segment_offset, uint8_t *buf, size_t len) {
     int fd = blockif_get_fd(bc, disk_offset);
-    size_t sector_size = (size_t)bc->bc_sectsz;
+    if (fd < 0) {
+        errno = EFAULT;
+        return -1;
+    }
+    size_t sector_size = (size_t)bc->sect_size;
     size_t block = 0;
 
-    if (bc->bc_split) {
+    if (bc->split_size) {
         // split file image, add file segment offset
-        size_t i = (disk_offset / (size_t)bc->bc_split);
-        block += i * (bc->bc_split / sector_size);
+        size_t i = (disk_offset / (size_t)bc->split_size);
+        block += i * (bc->split_size / sector_size);
     }
 
     // read
     size_t remaining = len;
     while (remaining > 0) {
         size_t current_block = block + (segment_offset / sector_size);
-        if (current_block > bc->bc_size / sector_size) {
-            fprintf(stderr, "reading past end of disk, requested block %zu of %zu (offset: %zu)\n", current_block, bc->bc_size / sector_size, disk_offset);
+        if (current_block > bc->size / sector_size) {
+            fprintf(stderr, "reading past end of disk, requested block %zu of %zu (offset: %zu)\n", current_block, bc->size / sector_size, disk_offset);
             errno = EFAULT;
             return -1;
         }
-        // fprintf(stderr, "reading block %zu/%zu -> offset %d\n", current_block, bc->bc_size / sector_size, bc->bc_sparse_lut[current_block]);
         
         size_t shift_offset = segment_offset % sector_size; // offset _in_ a sector
         size_t read_len = (remaining > sector_size) ? sector_size : remaining;
         
-        if (bc->bc_sparse_lut[current_block] < 0xffffffff) {
+        uint32_t lut_entry = bc->sparse_lut[current_block];
+        if (lut_entry < 0xffffffff) {
             // allocated block, get offset and read from file
-            size_t seek_offset = bc->bc_sparse_lut[current_block] * sector_size + shift_offset;
+            size_t seek_offset = lut_entry * sector_size + shift_offset;
             lseek(fd, (off_t)seek_offset, SEEK_SET);
             
-            ssize_t result = read(fd, buf, read_len - shift_offset);
-            // fprintf(stderr, "sparse read disk %zu, segment %zu, len %zu -> read %zu bytes\n", disk_offset, segment_offset, read_len, result);
+            ssize_t result;
+            do {
+                result = read(fd, buf, read_len - shift_offset);
+            } while ((result < 0) && ((errno == EAGAIN) || (errno == EINTR)));
+
             if (result < 0) {
                 return result;
             }
         } else {
             // sparse block, fill buffer with zeroes
-            // fprintf(stderr, "sparse read disk %zu, segment %zu, len %zu -> memset\n", disk_offset, segment_offset, read_len);
             memset(buf, 0, read_len - shift_offset);
         }
         
@@ -280,65 +154,82 @@ blockif_sparse_read(struct blockif_ctxt *bc, size_t disk_offset, size_t segment_
     return (ssize_t)len;
 }
 
-static ssize_t
-blockif_sparse_write(struct blockif_ctxt *bc, size_t disk_offset, size_t segment_offset, uint8_t *buf, size_t len) {
+static ssize_t blockif_sparse_write(blockif_ctxt bc, size_t disk_offset, size_t segment_offset, uint8_t *buf, size_t len) {
     int fd = blockif_get_fd(bc, disk_offset);
-    size_t sector_size = (size_t)bc->bc_sectsz;
+    if (fd < 0) {
+        errno = EFAULT;
+        return -1;
+    }
+
+    size_t sector_size = (size_t)bc->sect_size;
     size_t block = 0;
     
-    if (bc->bc_split) {
+    if (bc->split_size) {
         // split file image, add file segment offset
-        size_t i = (disk_offset / (size_t)bc->bc_split);
-        block += i * (bc->bc_split / sector_size);
+        size_t i = (disk_offset / (size_t)bc->split_size);
+        block += i * (bc->split_size / sector_size);
     }
     
     // read
     size_t remaining = len;
     while (remaining > 0) {
         size_t current_block = block + (segment_offset / sector_size);
-        if (current_block > bc->bc_size / sector_size) {
-            fprintf(stderr, "writing past end of disk, requested block %zu of %zu (offset: %zu)\n", current_block, bc->bc_size / sector_size, disk_offset);
+        if (current_block > bc->size / sector_size) {
+            fprintf(stderr, "writing past end of disk, requested block %zu of %zu (offset: %zu)\n", current_block, bc->size / sector_size, disk_offset);
             errno = EFAULT;
             return -1;
         }
-        // fprintf(stderr, "writing block %zu\n", current_block);
 
         size_t shift_offset = segment_offset % sector_size; // offset _in_ a sector
         size_t write_len = (remaining > sector_size) ? sector_size : remaining;
         
-        if (bc->bc_sparse_lut[current_block] < 0xffffffff) {
+        uint32_t lut_entry = bc->sparse_lut[current_block];
+        if (lut_entry < 0xffffffff) {
             // allocated block, get offset and read from file
-            size_t seek_offset = bc->bc_sparse_lut[current_block] * sector_size + shift_offset;
+            size_t seek_offset = lut_entry * sector_size + shift_offset;
             lseek(fd, (off_t)seek_offset, SEEK_SET);
             
-            ssize_t result = write(fd, buf, write_len - shift_offset);
-            // fprintf(stderr, "sparse write disk %zu, segment %zu, len %zu -> existing block %zu bytes\n", disk_offset, segment_offset, write_len, result);
+            ssize_t result;
+            do {
+                result = write(fd, buf, write_len - shift_offset);
+            } while ((result < 0) && ((errno == EAGAIN) || (errno == EINTR)));
+
             if (result < 0) {
                 return result;
             }
         } else {
             // sparse block, append to file
-            struct stat sbuf;
             ssize_t result;
             
             // check if the buffer is zeroes only
             int zeroes_only = 1;
-            for (uint8_t *ptr = buf; ptr < buf + write_len - shift_offset; ptr++) {
-                if (*ptr != 0) {
-                    zeroes_only = 0;
-                    break;
+            if (write_len % 8 == 0) {
+                for (uint64_t *ptr = (uint64_t *)buf; ptr < (uint64_t *)(buf + write_len - shift_offset); ptr++) {
+                    if (*ptr != 0) {
+                        zeroes_only = 0;
+                        break;
+                    }
+                }
+            } else {
+                for (uint8_t *ptr = buf; ptr < buf + write_len - shift_offset; ptr++) {
+                    if (*ptr != 0) {
+                        zeroes_only = 0;
+                        break;
+                    }
                 }
             }
             if (!zeroes_only) {
                 // save sector offset into lut
-                fstat(fd, &sbuf);
-                bc->bc_sparse_lut[current_block] = (uint32_t)((size_t)sbuf.st_size / (size_t)sector_size);
-                lseek(bc->bc_sparse_fd, (off_t)(current_block * 4), SEEK_SET);
-                result = write(bc->bc_sparse_fd, bc->bc_sparse_lut + current_block, 4);
+                off_t size = lseek(fd, 0, SEEK_END);
+                bc->sparse_lut[current_block] = (uint32_t)((size_t)size / (size_t)sector_size);
+                lseek(bc->sparse_fd, (off_t)(current_block * 4), SEEK_SET);
+                do {
+                    result = write(bc->sparse_fd, bc->sparse_lut + current_block, 4);
+                } while ((result < 0) && ((errno == EAGAIN) || (errno == EINTR)));
                 if (result < 0) {
                     return result;
                 }
-                fsync(bc->bc_sparse_fd);
+                fsync(bc->sparse_fd);
                 
                 // create sector
                 lseek(fd, 0, SEEK_END);
@@ -347,10 +238,12 @@ blockif_sparse_write(struct blockif_ctxt *bc, size_t disk_offset, size_t segment
                 write(fd, zeroBuffer, sector_size);
                 
                 // overwrite with data
-                size_t seek_offset = bc->bc_sparse_lut[current_block] * sector_size + shift_offset;
+                size_t seek_offset = bc->sparse_lut[current_block] * sector_size + shift_offset;
                 lseek(fd, (off_t)seek_offset, SEEK_SET);
-                result = write(fd, buf, write_len - shift_offset);
-                // fprintf(stderr, "sparse write disk %zu, segment %zu, len %zu -> new block %zu bytes\n", disk_offset, segment_offset, write_len, result);
+                do {
+                    result = write(fd, buf, write_len - shift_offset);
+                } while ((result < 0) && ((errno == EAGAIN) || (errno == EINTR)));
+
                 if (result < 0) {
                     return result;
                 }
@@ -371,33 +264,37 @@ blockif_sparse_write(struct blockif_ctxt *bc, size_t disk_offset, size_t segment
     return (ssize_t)len;
 }
 
-static ssize_t
-blockif_read_data(struct blockif_ctxt *bc, uint8_t *buf, size_t len, size_t offset) {
+static ssize_t blockif_read_data(blockif_ctxt bc, uint8_t *buf, size_t len, size_t offset) {
 	// find correct fd
 	int fd = blockif_get_fd(bc, offset);
-	ssize_t bytes = 0;
+    if (fd < 0) {
+        errno = EFAULT;
+        return -1;
+    }
 
-    // fprintf(stderr, "read %zu bytes at %zu\n", len, offset);
-    
-    if (!bc->bc_sparse) {
-        if (bc->bc_split) {
-            lseek(fd, (off_t)(offset % bc->bc_split), SEEK_SET);
+	ssize_t bytes = 0;
+   
+    if (!bc->is_sparse) {
+        if (bc->split_size) {
+            lseek(fd, (off_t)(offset % bc->split_size), SEEK_SET);
         } else {
             lseek(fd, (off_t)offset, SEEK_SET);
         }
     }
     
 	// is this a multi part read
-	if ((bc->bc_split) && (offset % bc->bc_split + len > bc->bc_split)) {
+	if ((bc->split_size) && (offset % bc->split_size + len > bc->split_size)) {
 		// read is longer than current segment
 
 		// read until end of segment
-		size_t len1 = bc->bc_split - (offset % bc->bc_split);
-        if (bc->bc_sparse) {
-            bytes = blockif_sparse_read(bc, offset, (offset % bc->bc_split), buf, len1);
-        } else {
-            bytes = read(fd, buf, len1);
-        }
+		size_t len1 = bc->split_size - (offset % bc->split_size);
+        do {
+            if (bc->is_sparse) {
+                bytes = blockif_sparse_read(bc, offset, (offset % bc->split_size), buf, len1);
+            } else {
+                bytes = read(fd, buf, len1);
+            }
+        } while ((bytes < 0) && ((errno == EAGAIN) || (errno == EINTR)));
 		if (bytes < 0) {
 			return bytes;
 		}
@@ -407,56 +304,66 @@ blockif_read_data(struct blockif_ctxt *bc, uint8_t *buf, size_t len, size_t offs
 		fd = blockif_get_fd(bc, offset + len1);
 
         ssize_t result;
-        if (bc->bc_sparse) {
-            result = blockif_sparse_read(bc, offset + len1, 0, buf + len1, len2);
-        } else {
-            lseek(fd, 0, SEEK_SET);
-            result = read(fd, buf + len1, len2);
-        }
+        do {
+            if (bc->is_sparse) {
+                result = blockif_sparse_read(bc, offset + len1, 0, buf + len1, len2);
+            } else {
+                lseek(fd, 0, SEEK_SET);
+                result = read(fd, buf + len1, len2);
+            }
+        } while ((result < 0) && ((errno == EAGAIN) || (errno == EINTR)));
+        
 		if (result < 0) {
 			return result;
 		}
 		bytes += result;
 	} else {
 		// read does not cross segment border
-        if (bc->bc_sparse) {
-            bytes = blockif_sparse_read(bc, offset, (offset % bc->bc_split), buf, len);
-        } else {
-            bytes = read(fd, buf, len);
-        }
+        do {
+            if (bc->is_sparse) {
+                bytes = blockif_sparse_read(bc, offset, (offset % bc->split_size), buf, len);
+            } else {
+                bytes = read(fd, buf, len);
+            }
+        } while ((bytes < 0) && ((errno == EAGAIN) || (errno == EINTR)));
 	}
 
 	// return read bytes
 	return bytes;
 }
 
-static ssize_t
-blockif_write_data(struct blockif_ctxt *bc, uint8_t *buf, size_t len, size_t offset) {
+static ssize_t blockif_write_data(blockif_ctxt bc, uint8_t *buf, size_t len, size_t offset) {
 	// find correct fd
 	int fd = blockif_get_fd(bc, offset);
+    if (fd < 0) {
+        errno = EFAULT;
+        return -1;
+    }
+
 	ssize_t bytes = 0;
 
-    // fprintf(stderr, "write %zu bytes at %zu\n", len, offset);
-
-    if (!bc->bc_sparse) {
-        if (bc->bc_split) {
-            lseek(fd, (off_t)(offset % bc->bc_split), SEEK_SET);
+    if (!bc->is_sparse) {
+        if (bc->split_size) {
+            lseek(fd, (off_t)(offset % bc->split_size), SEEK_SET);
         } else {
             lseek(fd, (off_t)offset, SEEK_SET);
         }
     }
 
 	// is this a multi part write
-	if ((bc->bc_split) && (offset % bc->bc_split + len > bc->bc_split)) {
+	if ((bc->split_size) && (offset % bc->split_size + len > bc->split_size)) {
 		// write is longer than current segment
 
 		// write until end of segment
-		size_t len1 = bc->bc_split - (offset % bc->bc_split);
-        if (bc->bc_sparse) {
-            bytes = blockif_sparse_write(bc, offset, (offset % bc->bc_split), buf, len1);
-        } else {
-            bytes = write(fd, buf, len1);
-        }
+		size_t len1 = bc->split_size - (offset % bc->split_size);
+        do {
+            if (bc->is_sparse) {
+                bytes = blockif_sparse_write(bc, offset, (offset % bc->split_size), buf, len1);
+            } else {
+                bytes = write(fd, buf, len1);
+            }
+        } while ((bytes < 0) && ((errno == EAGAIN) || (errno == EINTR)));
+        
 		if (bytes < 0) {
 			return bytes;
 		}
@@ -466,12 +373,14 @@ blockif_write_data(struct blockif_ctxt *bc, uint8_t *buf, size_t len, size_t off
 		fd = blockif_get_fd(bc, offset + len1);
         
         ssize_t result;
-        if (bc->bc_sparse) {
-            result = blockif_sparse_write(bc, offset + len1, 0, buf + len1, len2);
-        } else {
-            lseek(fd, 0, SEEK_SET);
-            result = write(fd, buf + len1, len2);
-        }
+        do {
+            if (bc->is_sparse) {
+                result = blockif_sparse_write(bc, offset + len1, 0, buf + len1, len2);
+            } else {
+                lseek(fd, 0, SEEK_SET);
+                result = write(fd, buf + len1, len2);
+            }
+        } while ((result < 0) && ((errno == EAGAIN) || (errno == EINTR)));
 
 		if (result < 0) {
 			return result;
@@ -479,766 +388,445 @@ blockif_write_data(struct blockif_ctxt *bc, uint8_t *buf, size_t len, size_t off
 		bytes += result;
 	} else {
 		// write does not cross segment border
-        if (bc->bc_sparse) {
-            bytes = blockif_sparse_write(bc, offset, (offset % bc->bc_split), buf, len);
-        } else {
-            bytes = write(fd, buf, len);
-        }
+        do {
+            if (bc->is_sparse) {
+                bytes = blockif_sparse_write(bc, offset, (offset % bc->split_size), buf, len);
+            } else {
+                bytes = write(fd, buf, len);
+            }
+        } while ((bytes < 0) && ((errno == EAGAIN) || (errno == EINTR)));
 	}
 
 	// return written bytes
 	return bytes;
 }
 
-static void
-blockif_proc(struct blockif_ctxt *bc, struct blockif_elem *be, uint8_t *buf)
-{
-	struct blockif_req *br;
-	// off_t arg[2];
-	ssize_t clen, len, off, boff, voff;
-	int i, err;
-
-	br = be->be_req;
-	if (br->br_iovcnt <= 1)
-		buf = NULL;
-	err = 0;
-	switch (be->be_op) {
-	case BOP_READ:
-		if (buf == NULL) {
-			// as we have to account for split disk images we disassemble
-			// the iovec buffers and call read for each of them
-			size_t offset = (size_t)br->br_offset;
-			for(i = 0; i < br->br_iovcnt; i++) {
-				len = blockif_read_data(bc, br->br_iov[i].iov_base, br->br_iov[i].iov_len, offset);
-				if (len < 0) {
-					err = errno;
-				} else {
-					br->br_resid -= len;
-				}
-				offset += br->br_iov[i].iov_len;
-			}
-			break;
-		}
-		i = 0;
-		off = voff = 0;
-		while (br->br_resid > 0) {
-			len = MIN(br->br_resid, MAXPHYS);
-
-			if (blockif_read_data(bc, buf, (size_t)len, (size_t)(br->br_offset + off)) < 0) {
-				err = errno;
-				break;
-			}
-
-			boff = 0;
-			do {
-				clen = MIN((len - boff),
-					(((ssize_t) br->br_iov[i].iov_len) - voff));
-				memcpy(((void *) (((uintptr_t) br->br_iov[i].iov_base) +
-					((size_t) voff))), buf + boff, clen);
-				if (clen < (((ssize_t) br->br_iov[i].iov_len) - voff))
-					voff += clen;
-				else {
-					i++;
-					voff = 0;
-				}
-				boff += clen;
-			} while (boff < len);
-			off += len;
-			br->br_resid -= len;
-		}
-		break;
-	case BOP_WRITE:
-		if (bc->bc_rdonly) {
-			err = EROFS;
-			break;
-		}
-		if (buf == NULL) {
-			// as we have to account for split disk images we disassemble
-			// the iovec buffers and call write for each of them
-			size_t offset = (size_t)br->br_offset;
-			for(i = 0; i < br->br_iovcnt; i++) {
-				len = blockif_write_data(bc, br->br_iov[i].iov_base, br->br_iov[i].iov_len, offset);
-				if (len < 0) {
-					err = errno;
-				} else {
-					br->br_resid -= len;
-				}
-				offset += br->br_iov[i].iov_len;
-			}
-			break;
-		}
-		i = 0;
-		off = voff = 0;
-		while (br->br_resid > 0) {
-			len = MIN(br->br_resid, MAXPHYS);
-			boff = 0;
-			do {
-				clen = MIN((len - boff),
-					(((ssize_t) br->br_iov[i].iov_len) - voff));
-				memcpy((buf + boff),
-					((void *) (((uintptr_t) br->br_iov[i].iov_base) +
-						((size_t) voff))), clen);
-				if (clen < (((ssize_t) br->br_iov[i].iov_len) - voff))
-					voff += clen;
-				else {
-					i++;
-					voff = 0;
-				}
-				boff += clen;
-			} while (boff < len);
-
-			if (blockif_write_data(bc, buf, (size_t)len, (size_t)(br->br_offset + off)) < 0) {
-				err = errno;
-				break;
-			}
-			off += len;
-			br->br_resid -= len;
-		}
-		break;
-	case BOP_FLUSH:
-		for(i = 0; i < bc->bc_num_fd; i++) {
-			if (bc->bc_ischr) {
-				if (ioctl(bc->bc_fd[i], DKIOCSYNCHRONIZECACHE))
-					err = errno;
-			} else if (fsync(bc->bc_fd[i]))
-				err = errno;
-		}
-		break;
-	case BOP_DELETE:
-		if (!bc->bc_candelete) {
-			err = EOPNOTSUPP;
-		// } else if (bc->bc_rdonly) {
-		// 	err = EROFS;
-		// } else if (bc->bc_ischr) {
-		// 	arg[0] = br->br_offset;
-		// 	arg[1] = br->br_resid;
-		// 	if (ioctl(bc->bc_fd, DIOCGDELETE, arg)) {
-		// 		err = errno;
-		// 	} else {
-		// 		br->br_resid = 0;
-		// 	}
-		} else {
-			err = EOPNOTSUPP;
-		}
-		break;
-	}
-
-	be->be_status = BST_DONE;
-
-	(*br->br_callback)(br, err);
-}
-
-static void *
-blockif_thr(void *arg)
-{
-	struct blockif_ctxt *bc;
-	struct blockif_elem *be;
-	pthread_t t;
-	uint8_t *buf;
-
-	bc = arg;
-	if (bc->bc_isgeom)
-		buf = malloc(MAXPHYS);
-	else
-		buf = NULL;
-	t = pthread_self();
-
-	pthread_mutex_lock(&bc->bc_mtx);
-	for (;;) {
-		while (blockif_dequeue(bc, t, &be)) {
-			pthread_mutex_unlock(&bc->bc_mtx);
-			blockif_proc(bc, be, buf);
-			pthread_mutex_lock(&bc->bc_mtx);
-			blockif_complete(bc, be);
-		}
-		/* Check ctxt status here to see if exit requested */
-		if (bc->bc_closing)
-			break;
-		pthread_cond_wait(&bc->bc_cond, &bc->bc_mtx);
-	}
-	pthread_mutex_unlock(&bc->bc_mtx);
-
-	if (buf)
-		free(buf);
-	pthread_exit(NULL);
-	return (NULL);
-}
-
-static void
-blockif_sigcont_handler(UNUSED int signal, UNUSED enum ev_type type,
-	UNUSED void *arg)
-{
-	struct blockif_sig_elem *bse;
-
-	for (;;) {
-		/*
-		 * Process the entire list even if not intended for
-		 * this thread.
-		 */
-		do {
-			bse = blockif_bse_head;
-			if (bse == NULL)
-				return;
-		} while (!atomic_cmpset_ptr((uintptr_t *)&blockif_bse_head,
-					    (uintptr_t)bse,
-					    (uintptr_t)bse->bse_next));
-
-		pthread_mutex_lock(&bse->bse_mtx);
-		bse->bse_pending = 0;
-		pthread_cond_signal(&bse->bse_cond);
-		pthread_mutex_unlock(&bse->bse_mtx);
-	}
-}
-
-static void
-blockif_init(void)
-{
-	mevent_add(SIGCONT, EVF_SIGNAL, blockif_sigcont_handler, NULL);
-	(void) signal(SIGCONT, SIG_IGN);
-}
-
-struct blockif_ctxt *
-blockif_open(const char *optstr, UNUSED const char *ident)
-{
-	// char name[MAXPATHLEN];
-	char *nopt, *xopts, *cp, tmp[255];
-	struct blockif_ctxt *bc;
-	struct stat sbuf;
-	// struct diocgattr_arg arg;
-	size_t size, psectsz, psectoff, split;
-	int extra, fd, sectsz;
-	int nocache, sync, ro, candelete, geom, ssopt, pssopt, sparse;
-	int *fds, sparse_fd;
-    uint32_t *sparse_lut;
+blockif_ctxt blockif_open(const char *optstr, UNUSED const char *ident) {
+	blockif_ctxt bc;
     
-	pthread_once(&blockif_once, blockif_init);
+    bc = calloc(1, sizeof(struct _blockif_ctxt));
+    if (bc == NULL) {
+        perror("calloc");
+        return NULL;
+    }
+    
+    bc->magic = (int) BLOCKIF_SIG;
+    bc->response_queue = dispatch_queue_create("org.xhyve.blockif.response", DISPATCH_QUEUE_SERIAL);
 
-	fd = -1;
-    sparse_fd = -1;
-	fds = NULL;
-    sparse_lut = NULL;
-	ssopt = 0;
-	nocache = 0;
-	sync = 0;
-	ro = 0;
-	size = 0;
-	split = 0;
-    sparse = 0;
-
-	pssopt = 0;
 	/*
 	 * The first element in the optstring is always a pathname.
 	 * Optional elements follow
 	 */
+    int extra = 0;
+    int ssopt = 0, pssopt = 0;
+    char *nopt, *xopts, *cp, tmp[255];
 	nopt = xopts = strdup(optstr);
 	while (xopts != NULL) {
 		cp = strsep(&xopts, ",");
-		if (cp == nopt)		/* file or device pathname */
+        if (cp == nopt) {		/* file or device pathname */
 			continue;
-		else if (!strcmp(cp, "nocache"))
-			nocache = 1;
-		else if (!strcmp(cp, "sync") || !strcmp(cp, "direct"))
-			sync = 1;
-		else if (!strcmp(cp, "ro"))
-			ro = 1;
-		else if (sscanf(cp, "sectorsize=%d/%d", &ssopt, &pssopt) == 2)
-			;
-		else if (sscanf(cp, "sectorsize=%d", &ssopt) == 1)
+        } else if (!strcmp(cp, "nocache")) {
+            perror("xhyve: nocache support unimplemented");
+            blockif_close(bc);
+            return NULL;
+        } else if (!strcmp(cp, "sync") || !strcmp(cp, "direct")) {
+            extra |= O_SYNC;
+        } else if (!strcmp(cp, "ro")) {
+			bc->is_readonly = 1;
+        } else if (sscanf(cp, "sectorsize=%d/%d", &ssopt, &pssopt) == 2) {
+            // not further actions
+        } else if (sscanf(cp, "sectorsize=%d", &ssopt) == 1) {
 			pssopt = ssopt;
-		else if (sscanf(cp, "size=%s", tmp) == 1) {
+        } else if (sscanf(cp, "size=%s", tmp) == 1) {
 			uint64_t num = 0;
 			if (expand_number(tmp, &num)) {
                 perror("xhyve: could not parse size parameter");
-				goto err;
+                blockif_close(bc);
+                return NULL;
 			}
-			size = (size_t)num;
-		}
-		else if (sscanf(cp, "split=%s", tmp) == 1) { /* split into chunks */
+			bc->size = (size_t)num;
+		} else if (sscanf(cp, "split=%s", tmp) == 1) { /* split into chunks */
 			uint64_t num = 0;
 			if (expand_number(tmp, &num)) {
                 perror("xhyve: could not parse split parameter");
-				goto err;
+                blockif_close(bc);
+                return NULL;
 			}
-			split = (size_t)num;
-		}
-        else if (!strcmp(cp, "sparse"))
-            sparse = 1;
-		else {
+            bc->split_size = (size_t)num;
+		} else if (!strcmp(cp, "sparse")) {
+            bc->is_sparse = 1;
+        } else {
 			fprintf(stderr, "Invalid device option \"%s\"\n", cp);
-			goto err;
+            blockif_close(bc);
+            return NULL;
 		}
 	}
+    
+    if (bc->split_size != 0) {
+        // open multiple files
+        if (bc->size == 0) {
+            perror("xhyve: when using 'split' a 'size' is required!");
+            blockif_close(bc);
+            return NULL;
+        }
 
-	extra = 0;
-	if (nocache) {
-		perror("xhyve: nocache support unimplemented");
-		goto err;
-		// extra |= O_DIRECT;
-	}
-	if (sync)
-		extra |= O_SYNC;
+        bc->num_fd = (bc->size / bc->split_size) + 1;
+        bc->fd = malloc(sizeof(int) * bc->num_fd);
+        for (size_t i = 0; i < bc->num_fd; i++) {
+            bc->fd[i] = -1;
+        }
 
-	if (split != 0) {
-		// open multiple files
-		if (size == 0) {
-			perror("xhyve: when using 'split' a 'size' is required!");
-			goto err;
-		}
+        printf("Split disk, opening %zu image parts\n", bc->num_fd);
 
-		size_t num_parts = size / split;
-		fds = malloc(sizeof(int) * num_parts);
-		for (size_t i = 0; i < num_parts; i++) {
-			fds[i] = -1;
-		}
+        for (size_t i = 0; i < bc->num_fd; i++) {
+            size_t len = strlen(nopt) + 6;
+            char *filename = calloc(len, 1);
+            snprintf(filename, len, "%s.%04zu", nopt, i);
 
-		printf("Split disk, opening %zu image parts\n", num_parts);
+            printf(" - %s\n", filename);
 
-		for (size_t i = 0; i < num_parts; i++) {
-			size_t len = strlen(nopt) + 6;
-			char *filename = calloc(len, 1);
-			snprintf(filename, len, "%s.%04zu", nopt, i);
-
-			printf(" - %s\n", filename);
-
-			fd = open(filename, (ro ? O_RDONLY : O_RDWR | O_CREAT) | extra);
-			if (fd < 0 && !ro) {
-				perror("Could not open backing file r/w, reverting to readonly");
-				/* Attempt a r/w fail with a r/o open */
-				fd = open(filename, O_RDONLY | extra);
-				ro = 1;
-			}
+            bc->fd[i] = open(filename, (bc->is_readonly ? O_RDONLY : O_RDWR | O_CREAT) | extra);
+            if (bc->fd[i] < 0 && !bc->is_readonly) {
+                perror("Could not open backing file r/w, reverting to readonly");
+                /* Attempt a r/w fail with a r/o open */
+                bc->fd[i] = open(filename, O_RDONLY | extra);
+                bc->is_readonly = 1;
+            }
             free(filename);
 
-			if (fd < 0) {
-				perror("Could not open backing file");
-				goto err;
-			}
+            if (bc->fd[i] < 0) {
+                perror("Could not open backing file");
+                blockif_close(bc);
+                return NULL;
+            }
 
-			if (fstat(fd, &sbuf) < 0) {
-				perror("Could not stat backing file");
-				goto err;
-			}
+            if (lseek(bc->fd[i], 0, SEEK_END) == 0) {
+                // create image file
+                fchmod(bc->fd[i], 0660);
+                if (!bc->is_sparse) {
+                    printf("   -> file does not exist, creating empty file\n");
 
-			if (sbuf.st_size == 0) {
-				// create image file
-				printf("   -> file does not exist, creating empty file\n");
-				fchmod(fd, 0660);
-                if (!sparse) {
                     char buffer[1024];
                     memset(buffer, 0, 1024);
-                    for(size_t j = 0; j < split / 1024; j++) {
-                        write(fd, buffer, 1024);
+                    for(size_t j = 0; j < bc->split_size / 1024; j++) {
+                        ssize_t result;
+                        do {
+                            result = write(bc->fd[i], buffer, 1024);
+                        } while ((result < 0) && ((errno == EAGAIN) || (errno == EINTR)));
                     }
                 }
-				lseek(fd, 0, SEEK_SET);
-			}
-
-			fds[i] = fd;
-		}
-	} else {
+                lseek(bc->fd[i], 0, SEEK_SET);
+            }
+        }
+    } else {
         // open a single file
         printf("Single image disk\n");
 
-		fd = open(nopt, (ro ? O_RDONLY : O_RDWR | O_CREAT) | extra);
-		if (fd < 0 && !ro) {
+        bc->fd = malloc(sizeof(int));
+        bc->fd[0] = -1;
+
+        bc->fd[0] = open(nopt, (bc->is_readonly ? O_RDONLY : O_RDWR | O_CREAT) | extra);
+        if (bc->fd[0] < 0 && !bc->is_readonly) {
             perror("Could not open backing file r/w, reverting to readonly");
-			/* Attempt a r/w fail with a r/o open */
-			fd = open(nopt, O_RDONLY | extra);
-			ro = 1;
-		}
+            /* Attempt a r/w fail with a r/o open */
+            bc->fd[0] = open(nopt, O_RDONLY | extra);
+            bc->is_readonly = 1;
+        }
 
-		if (fd < 0) {
-			perror("Could not open backing file");
-			goto err;
-		}
+        if (bc->fd[0] < 0) {
+            perror("Could not open backing file");
+            blockif_close(bc);
+            return NULL;
+        }
 
-		if (fstat(fd, &sbuf) < 0) {
-			perror("Could not stat backing file");
-			goto err;
-		}
-
-		if (size == 0) {
-			size = (size_t)sbuf.st_size;
-		}
-		if (sbuf.st_size == 0) {
-			// TODO: make growing disks possible
-			// create image file
-			printf(" -> file does not exist, creating empty file\n");
-			fchmod(fd, 0660);
-            if (!sparse) {
+        if (lseek(bc->fd[0], 0, SEEK_END) == 0) {
+            // TODO: make growing disks possible
+            // create image file
+            fchmod(bc->fd[0], 0660);
+            if (!bc->is_sparse) {
+                printf(" -> file does not exist, creating empty file\n");
                 char buffer[1024];
                 memset(buffer, 0, 1024);
-                for(size_t i = 0; i < size / 1024; i++) {
-                    write(fd, buffer, 1024);
+                for(size_t i = 0; i < bc->size / 1024; i++) {
+                    ssize_t result;
+                    do {
+                        result = write(bc->fd[0], buffer, 1024);
+                    } while ((result < 0) && ((errno == EAGAIN) || (errno == EINTR)));
                 }
             }
-			lseek(fd, 0, SEEK_SET);
-		}
+        }
+        bc->size = (size_t)lseek(bc->fd[0], 0, SEEK_END);
     }
     
     /*
-	 * Deal with raw devices
-	 */
-	sectsz = DEV_BSIZE;
-	psectsz = psectoff = 0;
-	candelete = geom = 0;
-	if (S_ISCHR(sbuf.st_mode)) {
-		perror("xhyve: raw device support unimplemented");
-		goto err;
-		// if (ioctl(fd, DIOCGMEDIASIZE, &size) < 0 ||
-		// 	ioctl(fd, DIOCGSECTORSIZE, &sectsz))
-		// {
-		// 	perror("Could not fetch dev blk/sector size");
-		// 	goto err;
-		// }
-		// assert(size != 0);
-		// assert(sectsz != 0);
-		// if (ioctl(fd, DIOCGSTRIPESIZE, &psectsz) == 0 && psectsz > 0)
-		// 	ioctl(fd, DIOCGSTRIPEOFFSET, &psectoff);
-		// strlcpy(arg.name, "GEOM::candelete", sizeof(arg.name));
-		// arg.len = sizeof(arg.value.i);
-		// if (ioctl(fd, DIOCGATTR, &arg) == 0)
-		// 	candelete = arg.value.i;
-		// if (ioctl(fd, DIOCGPROVIDERNAME, name) == 0)
-		// 	geom = 1;
-	} else
-		psectsz = (size_t)sbuf.st_blksize;
+     * Deal with raw devices
+     */
+    bc->sect_size = DEV_BSIZE;
+    bc->phys_sect_offset = 0;
+    bc->can_delete = 0;
+    struct stat sbuf;
+    if (fstat(bc->fd[0], &sbuf)) {
+        fprintf(stderr, "Could not stat first disk image file, assuming physical sector size of 512!\n");
+        bc->phys_sect_size = 512;
+    } else {
+        bc->phys_sect_size = (int)sbuf.st_blksize;
+    }
 
-	if (ssopt != 0) {
-		if (!powerof2(ssopt) || !powerof2(pssopt) || ssopt < 512 ||
-		    ssopt > pssopt) {
-			fprintf(stderr, "Invalid sector size %d/%d\n",
-			    ssopt, pssopt);
-			goto err;
-		}
+    if ((bc->split_size == 0) && (S_ISCHR(sbuf.st_mode))) {
+        off_t blocks;
+        if (ioctl(bc->fd[0], DKIOCGETBLOCKCOUNT, &blocks) < 0 ||
+            ioctl(bc->fd[0], DKIOCGETBLOCKSIZE, &bc->sect_size))
+        {
+            perror("Could not fetch dev blk/sector size");
+            blockif_close(bc);
+            return NULL;
+        }
+        assert(blocks != 0);
+        assert(bc->sect_size != 0);
+        
+        bc->size = (size_t)(blocks * bc->sect_size);
+    }
+    
+    if (ssopt != 0) {
+        if (!powerof2(ssopt) || !powerof2(pssopt) || ssopt < 512 ||
+            ssopt > pssopt) {
+            fprintf(stderr, "Invalid sector size %d/%d\n",
+                ssopt, pssopt);
+            blockif_close(bc);
+            return NULL;
+        }
 
-		// /*
-		//  * Some backend drivers (e.g. cd0, ada0) require that the I/O
-		//  * size be a multiple of the device's sector size.
-		//  *
-		//  * Validate that the emulated sector size complies with this
-		//  * requirement.
-		//  */
-		// if (S_ISCHR(sbuf.st_mode)) {
-		// 	if (ssopt < sectsz || (ssopt % sectsz) != 0) {
-		// 		fprintf(stderr, "Sector size %d incompatible "
-		// 		    "with underlying device sector size %d\n",
-		// 		    ssopt, sectsz);
-		// 		goto err;
-		// 	}
-		// }
+        /*
+         * Some backend drivers (e.g. cd0, ada0) require that the I/O
+         * size be a multiple of the device's sector size.
+         *
+         * Validate that the emulated sector size complies with this
+         * requirement.
+         */
+        if (S_ISCHR(sbuf.st_mode)) {
+            if (ssopt < bc->sect_size || (ssopt % bc->sect_size) != 0) {
+                fprintf(stderr, "Sector size %d incompatible "
+                        "with underlying device sector size %d\n",
+                        ssopt, bc->sect_size);
+                blockif_close(bc);
+                return NULL;
+            }
+        }
+        
+        bc->sect_size = ssopt;
+        bc->phys_sect_size = (int)pssopt;
+        bc->phys_sect_offset = 0;
+    }
 
-		sectsz = ssopt;
-		psectsz = (size_t)pssopt;
-		psectoff = 0;
-	}
-
-    if (sparse) {
+    if (bc->is_sparse) {
         size_t len = strlen(nopt) + 6;
         char *filename = calloc(len, 1);
         snprintf(filename, len, "%s.lut", nopt);
-
+        
         // open lut file
-        sparse_fd = open(filename, (ro ? O_RDONLY : O_RDWR | O_CREAT) | extra);
-        if (sparse_fd < 0 && !ro) {
+        bc->sparse_fd = open(filename, (bc->is_readonly ? O_RDONLY : O_RDWR | O_CREAT) | extra);
+        if (bc->sparse_fd < 0 && !bc->is_readonly) {
             perror("Could not open sparse lut file r/w, reverting to readonly");
             /* Attempt a r/w fail with a r/o open */
-            sparse_fd = open(filename, O_RDONLY | extra);
-            ro = 1;
+            bc->sparse_fd = open(filename, O_RDONLY | extra);
+            bc->is_readonly = 1;
         }
         free(filename);
         
-        if (sparse_fd < 0) {
+        if (bc->sparse_fd < 0) {
             perror("Could not open sparse lut file");
-            goto err;
+            blockif_close(bc);
+            return NULL;
         }
         
-        if (fstat(sparse_fd, &sbuf) < 0) {
-            perror("Could not stat sparse lut file");
-            goto err;
-        }
-        
-        if (sbuf.st_size == 0) {
+        size_t lut_size = (size_t)lseek(bc->sparse_fd, 0, SEEK_END);
+        if (lut_size == 0) {
             // TODO: make growing disks possible
             // create lut file
             printf(" -> sparse lut file does not exist, creating empty file\n");
-            fchmod(sparse_fd, 0660);
+            fchmod(bc->sparse_fd, 0660);
             unsigned char buffer[4] = { 0xff, 0xff, 0xff, 0xff };
-            for(size_t i = 0; i < size / (size_t)sectsz; i++) {
-                write(sparse_fd, buffer, 4);
+            for(size_t i = 0; i < bc->size / (size_t)bc->sect_size; i++) {
+                ssize_t result;
+                do {
+                    result = write(bc->sparse_fd, buffer, 4);
+                } while ((result < 0) && ((errno == EAGAIN) || (errno == EINTR)));
             }
-            lseek(sparse_fd, 0, SEEK_SET);
-            fstat(fd, &sbuf);
+            fsync(bc->sparse_fd);
+            lut_size = (size_t)lseek(bc->sparse_fd, 0, SEEK_END);
         }
-
+        
+        if (lut_size == 0) {
+            fprintf(stderr, "Could not initialize sparse lookup table\n");
+            blockif_close(bc);
+            return NULL;
+        }
+        
         // read sparse lut
-        sparse_lut = malloc((size_t)sbuf.st_size);
+        bc->sparse_lut = malloc((size_t)lut_size);
+        bc->sparse_lut_size = (uint32_t)lut_size;
         ssize_t bytes = 0;
-        for (size_t i = 0; i < (size_t)sbuf.st_size; i += 1024) {
-            ssize_t result = read(sparse_fd, (char *)sparse_lut + i, 1024);
+        lseek(bc->sparse_fd, 0, SEEK_SET);
+        for (size_t i = 0; i < lut_size; i += 4096) {
+            ssize_t result;
+            do {
+                result = read(bc->sparse_fd, ((char *)bc->sparse_lut) + i, 4096);
+            } while ((result < 0) && ((errno == EAGAIN) || (errno == EINTR)));
+            
             if (result < 0) {
                 perror("Could not load sparse lut");
-                goto err;
+                blockif_close(bc);
+                return NULL;
             }
             bytes += result;
         }
-//        fprintf(stderr, "Read %zu bytes of lut\n", bytes);
     }
 
-	bc = calloc(1, sizeof(struct blockif_ctxt));
-	if (bc == NULL) {
-		perror("calloc");
-		goto err;
-	}
 
-	bc->bc_magic = (int) BLOCKIF_SIG;
-	if (split == 0) {
-		bc->bc_num_fd = 1;
-		bc->bc_fd = malloc(sizeof(int));
-		bc->bc_fd[0] = fd;
-	} else {
-		bc->bc_num_fd = (int)(size / split);
-		bc->bc_fd = fds;
-	}
-    bc->bc_sparse = sparse;
-    if (sparse) {
-        bc->bc_sparse_lut = sparse_lut;
-        bc->bc_sparse_fd = sparse_fd;
+    if (bc->magic == ((int) BLOCKIF_SIG)) {
+        return bc;
     }
-	bc->bc_ischr = S_ISCHR(sbuf.st_mode);
-	bc->bc_isgeom = geom;
-	bc->bc_candelete = candelete;
-	bc->bc_rdonly = ro;
-	bc->bc_size = size;
-	bc->bc_split = split;
-	bc->bc_sectsz = sectsz;
-	bc->bc_psectsz = (int) psectsz;
-	bc->bc_psectoff = (int) psectoff;
-	pthread_mutex_init(&bc->bc_mtx, NULL);
-	pthread_cond_init(&bc->bc_cond, NULL);
-	TAILQ_INIT(&bc->bc_freeq);
-	TAILQ_INIT(&bc->bc_pendq);
-	TAILQ_INIT(&bc->bc_busyq);
-	for (int i = 0; i < BLOCKIF_MAXREQ; i++) {
-		bc->bc_reqs[i].be_status = BST_FREE;
-		TAILQ_INSERT_HEAD(&bc->bc_freeq, &bc->bc_reqs[i], be_link);
-	}
-
-	for (int i = 0; i < BLOCKIF_NUMTHR; i++) {
-		pthread_create(&bc->bc_btid[i], NULL, blockif_thr, bc);
-	}
-
-	return (bc);
-err:
-	if (fd >= 0)
-		close(fd);
-	if (fds != NULL) {
-		int num_fds = (int)(size / split);
-		for (int i = 0; i < num_fds; i++) {
-			if (fds[i] >= 0) {
-				close(fds[i]);
-			}
-		}
-		free(fds);
-	}
-	return (NULL);
+    return NULL;
 }
 
-static int
-blockif_request(struct blockif_ctxt *bc, struct blockif_req *breq,
-		enum blockop op)
-{
-	int err;
+int blockif_read(blockif_ctxt bc, struct blockif_req *br) {
+    assert(bc->magic == ((int) BLOCKIF_SIG));
+    dispatch_async(bc->response_queue, ^{
+        int err = 0;
+        assert(bc->magic == ((int) BLOCKIF_SIG));
+        
+        // as we have to account for split disk images we disassemble
+        // the iovec buffers and call read for each of them
+        size_t offset = (size_t)br->br_offset;
+        for(int i = 0; i < br->br_iovcnt; i++) {
+            ssize_t len = blockif_read_data(bc, br->br_iov[i].iov_base, br->br_iov[i].iov_len, offset);
+            if (len < 0) {
+                err = errno;
+            } else {
+                br->br_resid -= len;
+            }
+            offset += br->br_iov[i].iov_len;
+        }
 
-	err = 0;
-
-	pthread_mutex_lock(&bc->bc_mtx);
-	if (!TAILQ_EMPTY(&bc->bc_freeq)) {
-		/*
-		 * Enqueue and inform the block i/o thread
-		 * that there is work available
-		 */
-		if (blockif_enqueue(bc, breq, op))
-			pthread_cond_signal(&bc->bc_cond);
-	} else {
-		/*
-		 * Callers are not allowed to enqueue more than
-		 * the specified blockif queue limit. Return an
-		 * error to indicate that the queue length has been
-		 * exceeded.
-		 */
-		err = E2BIG;
-	}
-	pthread_mutex_unlock(&bc->bc_mtx);
-
-	return (err);
+        (*br->br_callback)(br, err);
+    });
+	return 0;
 }
 
-int
-blockif_read(struct blockif_ctxt *bc, struct blockif_req *breq)
-{
-	assert(bc->bc_magic == ((int) BLOCKIF_SIG));
-	return (blockif_request(bc, breq, BOP_READ));
+int blockif_write(blockif_ctxt bc, struct blockif_req *br) {
+    assert(bc->magic == ((int) BLOCKIF_SIG));
+    dispatch_barrier_async(bc->response_queue, ^{
+        int err = 0;
+        assert(bc->magic == ((int) BLOCKIF_SIG));
+        
+        if (bc->is_readonly) {
+            err = EROFS;
+        } else {
+            // as we have to account for split disk images we disassemble
+            // the iovec buffers and call write for each of them
+            size_t offset = (size_t)br->br_offset;
+            for(int i = 0; i < br->br_iovcnt; i++) {
+                ssize_t len = blockif_write_data(bc, br->br_iov[i].iov_base, br->br_iov[i].iov_len, offset);
+                if (len < 0) {
+                    err = errno;
+                } else {
+                    br->br_resid -= len;
+                }
+                offset += br->br_iov[i].iov_len;
+            }
+        }
+        
+        (*br->br_callback)(br, err);
+    });
+    return 0;
 }
 
-int
-blockif_write(struct blockif_ctxt *bc, struct blockif_req *breq)
-{
-	assert(bc->bc_magic == ((int) BLOCKIF_SIG));
-	return (blockif_request(bc, breq, BOP_WRITE));
+int blockif_flush(blockif_ctxt bc, struct blockif_req *br) {
+    assert(bc->magic == ((int) BLOCKIF_SIG));
+
+    dispatch_barrier_async(bc->response_queue, ^{
+        int err = 0;
+        assert(bc->magic == ((int) BLOCKIF_SIG));
+
+        for(unsigned long i = 0; i < bc->num_fd; i++) {
+            if (fsync(bc->fd[i])) {
+                err = errno;
+            }
+        }
+
+        (*br->br_callback)(br, err);
+    });
+	return 0;
 }
 
-int
-blockif_flush(struct blockif_ctxt *bc, struct blockif_req *breq)
-{
-	assert(bc->bc_magic == ((int) BLOCKIF_SIG));
-	return (blockif_request(bc, breq, BOP_FLUSH));
-}
-
-int
-blockif_delete(struct blockif_ctxt *bc, struct blockif_req *breq)
-{
-	assert(bc->bc_magic == ((int) BLOCKIF_SIG));
-	return (blockif_request(bc, breq, BOP_DELETE));
-}
-
-int
-blockif_cancel(struct blockif_ctxt *bc, struct blockif_req *breq)
-{
-	struct blockif_elem *be;
-
-	assert(bc->bc_magic == ((int) BLOCKIF_SIG));
-
-	pthread_mutex_lock(&bc->bc_mtx);
-	/*
-	 * Check pending requests.
-	 */
-	TAILQ_FOREACH(be, &bc->bc_pendq, be_link) {
-		if (be->be_req == breq)
-			break;
-	}
-	if (be != NULL) {
-		/*
-		 * Found it.
-		 */
-		blockif_complete(bc, be);
-		pthread_mutex_unlock(&bc->bc_mtx);
-
-		return (0);
-	}
-
-	/*
-	 * Check in-flight requests.
-	 */
-	TAILQ_FOREACH(be, &bc->bc_busyq, be_link) {
-		if (be->be_req == breq)
-			break;
-	}
-	if (be == NULL) {
-		/*
-		 * Didn't find it.
-		 */
-		pthread_mutex_unlock(&bc->bc_mtx);
-		return (EINVAL);
-	}
-
-	/*
-	 * Interrupt the processing thread to force it return
-	 * prematurely via it's normal callback path.
-	 */
-	while (be->be_status == BST_BUSY) {
-		struct blockif_sig_elem bse, *old_head;
-
-		pthread_mutex_init(&bse.bse_mtx, NULL);
-		pthread_cond_init(&bse.bse_cond, NULL);
-
-		bse.bse_pending = 1;
-
-		do {
-			old_head = blockif_bse_head;
-			bse.bse_next = old_head;
-		} while (!atomic_cmpset_ptr((uintptr_t *)&blockif_bse_head,
-					    (uintptr_t)old_head,
-					    (uintptr_t)&bse));
-
-		pthread_kill(be->be_tid, SIGCONT);
-
-		pthread_mutex_lock(&bse.bse_mtx);
-		while (bse.bse_pending)
-			pthread_cond_wait(&bse.bse_cond, &bse.bse_mtx);
-		pthread_mutex_unlock(&bse.bse_mtx);
-	}
-
-	pthread_mutex_unlock(&bc->bc_mtx);
-
-	/*
-	 * The processing thread has been interrupted.  Since it's not
-	 * clear if the callback has been invoked yet, return EBUSY.
-	 */
-	return (EBUSY);
-}
-
-int
-blockif_close(struct blockif_ctxt *bc)
-{
-	void *jval;
-	int err, i;
-
-	err = 0;
-
-	assert(bc->bc_magic == ((int) BLOCKIF_SIG));
-
-	/*
-	 * Stop the block i/o thread
-	 */
-	pthread_mutex_lock(&bc->bc_mtx);
-	bc->bc_closing = 1;
-	pthread_mutex_unlock(&bc->bc_mtx);
-	pthread_cond_broadcast(&bc->bc_cond);
-	for (i = 0; i < BLOCKIF_NUMTHR; i++) {
-		pthread_join(bc->bc_btid[i], &jval);
-	}
-
-	/* XXX Cancel queued i/o's ??? */
-
-	/*
-	 * Release resources
-	 */
-	bc->bc_magic = 0;
-	for(i = 0; i < bc->bc_num_fd; i++) {
-		close(bc->bc_fd[i]);
-	}
-	free(bc->bc_fd);
+int blockif_delete(blockif_ctxt bc, struct blockif_req *br) {
+	assert(bc->magic == ((int) BLOCKIF_SIG));
     
-    if (bc->bc_sparse) {
-        close(bc->bc_sparse_fd);
-        free(bc->bc_sparse_lut);
-    }
-    
-	free(bc);
+    dispatch_barrier_async(bc->response_queue, ^{
+        assert(bc->magic == ((int) BLOCKIF_SIG));
+        (*br->br_callback)(br, EOPNOTSUPP);
+    });
+    return 0;
+}
 
-	return (0);
+int blockif_cancel(blockif_ctxt bc, struct blockif_req *br) {
+	assert(bc->magic == ((int) BLOCKIF_SIG));
+
+    // nothing to cancel really, just call the callback and ignore the call
+    dispatch_barrier_async(bc->response_queue, ^{
+        assert(bc->magic == ((int) BLOCKIF_SIG));
+        (*br->br_callback)(br, 0);
+    });
+	return 0;
+}
+
+int blockif_close(blockif_ctxt bc) {
+	assert(bc->magic == ((int) BLOCKIF_SIG));
+    dispatch_barrier_async(bc->response_queue, ^{
+        assert(bc->magic == ((int) BLOCKIF_SIG));
+
+        // Release resources
+        bc->magic = 0;
+        if (bc->fd) {
+            for(unsigned long i = 0; i < bc->num_fd; i++) {
+                if (bc->fd[i] >= 0) {
+                    close(bc->fd[i]);
+                }
+            }
+            free(bc->fd);
+        }
+        
+        if (bc->is_sparse) {
+            if (bc->sparse_fd >= 0) {
+                close(bc->sparse_fd);
+            }
+            if (bc->sparse_lut) {
+                free(bc->sparse_lut);
+            }
+        }
+        free(bc);
+    });
+	return 0;
 }
 
 /*
  * Return virtual C/H/S values for a given block. Use the algorithm
  * outlined in the VHD specification to calculate values.
  */
-void
-blockif_chs(struct blockif_ctxt *bc, uint16_t *c, uint8_t *h, uint8_t *s)
-{
+void blockif_chs(blockif_ctxt bc, uint16_t *c, uint8_t *h, uint8_t *s) {
 	off_t sectors;		/* total sectors of the block dev */
 	off_t hcyl;		/* cylinders times heads */
 	uint16_t secpt;		/* sectors per track */
 	uint8_t heads;
 
-	assert(bc->bc_magic == ((int) BLOCKIF_SIG));
+	assert(bc->magic == ((int) BLOCKIF_SIG));
 
-	sectors = (off_t)(bc->bc_size / (size_t)bc->bc_sectsz);
+	sectors = (off_t)(bc->size / (size_t)bc->sect_size);
 
 	/* Clamp the size to the largest possible with CHS */
-	if (sectors > 65535LL*16*255)
+    if (sectors > 65535LL*16*255) {
 		sectors = 65535LL*16*255;
+    }
 
 	if (sectors >= 65536LL*16*63) {
 		secpt = 255;
@@ -1249,8 +837,9 @@ blockif_chs(struct blockif_ctxt *bc, uint16_t *c, uint8_t *h, uint8_t *s)
 		hcyl = sectors / secpt;
 		heads = (uint8_t) ((hcyl + 1023) / 1024);
 
-		if (heads < 4)
+        if (heads < 4) {
 			heads = 4;
+        }
 
 		if (hcyl >= (heads * 1024) || heads > 16) {
 			secpt = 31;
@@ -1272,45 +861,33 @@ blockif_chs(struct blockif_ctxt *bc, uint16_t *c, uint8_t *h, uint8_t *s)
 /*
  * Accessors
  */
-off_t
-blockif_size(struct blockif_ctxt *bc)
-{
-	assert(bc->bc_magic == ((int) BLOCKIF_SIG));
-	return (off_t)(bc->bc_size);
+off_t blockif_size(blockif_ctxt bc) {
+	assert(bc->magic == ((int) BLOCKIF_SIG));
+	return (off_t)(bc->size);
 }
 
-int
-blockif_sectsz(struct blockif_ctxt *bc)
-{
-	assert(bc->bc_magic == ((int) BLOCKIF_SIG));
-	return (bc->bc_sectsz);
+int blockif_sectsz(blockif_ctxt bc) {
+	assert(bc->magic == ((int) BLOCKIF_SIG));
+	return (bc->sect_size);
 }
 
-void
-blockif_psectsz(struct blockif_ctxt *bc, int *size, int *off)
-{
-	assert(bc->bc_magic == ((int) BLOCKIF_SIG));
-	*size = bc->bc_psectsz;
-	*off = bc->bc_psectoff;
+void blockif_psectsz(blockif_ctxt bc, int *size, int *off) {
+	assert(bc->magic == ((int) BLOCKIF_SIG));
+	*size = bc->phys_sect_size;
+	*off = bc->phys_sect_offset;
 }
 
-int
-blockif_queuesz(struct blockif_ctxt *bc)
-{
-	assert(bc->bc_magic == ((int) BLOCKIF_SIG));
-	return (BLOCKIF_MAXREQ - 1);
+int blockif_queuesz(blockif_ctxt bc) {
+	assert(bc->magic == ((int) BLOCKIF_SIG));
+	return 128;
 }
 
-int
-blockif_is_ro(struct blockif_ctxt *bc)
-{
-	assert(bc->bc_magic == ((int) BLOCKIF_SIG));
-	return (bc->bc_rdonly);
+int blockif_is_ro(blockif_ctxt bc) {
+	assert(bc->magic == ((int) BLOCKIF_SIG));
+	return (bc->is_readonly);
 }
 
-int
-blockif_candelete(struct blockif_ctxt *bc)
-{
-	assert(bc->bc_magic == ((int) BLOCKIF_SIG));
-	return (bc->bc_candelete);
+int blockif_candelete(blockif_ctxt bc) {
+	assert(bc->magic == ((int) BLOCKIF_SIG));
+	return (bc->can_delete);
 }

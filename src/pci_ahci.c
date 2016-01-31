@@ -133,7 +133,7 @@ struct ahci_ioreq {
 
 #define AHCI_PORT_IDENT 20 + 1
 struct ahci_port {
-	struct blockif_ctxt *bctx;
+	blockif_ctxt bctx;
 	struct pci_ahci_softc *pr_sc;
 	uint8_t *cmd_lst;
 	uint8_t *rfis;
@@ -2273,7 +2273,7 @@ static int
 pci_ahci_init(struct pci_devinst *pi, char *opts, int atapi)
 {
 	char bident[sizeof("XX:X:X")];
-	struct blockif_ctxt *bctxt;
+	blockif_ctxt bctxt;
 	struct pci_ahci_softc *sc;
 	int ret, slots;
 	MD5_CTX mdctx;
